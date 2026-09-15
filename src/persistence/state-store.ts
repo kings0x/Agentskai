@@ -1,10 +1,11 @@
 import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { Automation, PersistedState, SessionSnapshot } from '../types.js';
+import type { PlatformStore } from './store.js';
 
 const EMPTY_STATE: PersistedState = { version: 1, sessions: [], automations: [] };
 
-export class StateStore {
+export class StateStore implements PlatformStore {
   private state: PersistedState = structuredClone(EMPTY_STATE);
   private writeQueue: Promise<void> = Promise.resolve();
   private writeError: Error | null = null;

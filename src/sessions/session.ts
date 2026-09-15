@@ -26,7 +26,7 @@ function defaultShell(): { command: string; args: string[] } {
   return { command: process.env.SHELL ?? '/bin/bash', args: ['-l'] };
 }
 
-function commandFor(config: SessionConfig): { command: string; args: string[] } {
+function hostCommandFor(config: SessionConfig): { command: string; args: string[] } {
   if (config.mode === 'shell') return defaultShell();
   if (config.mode === 'claude') return { command: process.platform === 'win32' ? 'claude.cmd' : 'claude', args: [] };
   return { command: config.command ?? defaultShell().command, args: config.args ?? [] };
@@ -45,15 +45,18 @@ export class Session extends EventEmitter {
   private detaching = false;
   private readonly handledInputIds = new Set<string>();
 
-  constructor(readonly config: SessionConfig, options?: { id?: string; createdAt?: string; tmuxName?: string }) {
+  constructor(readonly config: SessionConfig, options?: { id?: string; createdAt?: string; tmuxName?: string; dockerEnvFile?: string }) {
     super();
     this.id = options?.id ?? randomUUID();
     this.createdAt = options?.createdAt ?? new Date().toISOString();
     this.tmuxName = options?.tmuxName ?? `agentdock-${this.id.replaceAll('-', '').slice(0, 20)}`;
+    this.dockerEnvFile = options?.dockerEnvFile;
   }
 
+  private readonly dockerEnvFile?: string;
+
   start(options: { requireExistingTmux?: boolean } = {}): void {
-    const { command, args } = commandFor(this.config);
+    const { command, args } = this.commandForRuntime();
     try {
       const useTmux = this.config.persist !== false && tmuxAvailable();
       if (useTmux) {
@@ -153,6 +156,16 @@ export class Session extends EventEmitter {
       env: { ...process.env, TERM: 'xterm-256color' } as Record<string, string>,
       useConpty: process.platform === 'win32',
     };
+  }
+
+  private commandForRuntime(): { command: string; args: string[] } {
+    const inner = hostCommandFor(this.config);
+    if (!this.config.containerName) return inner;
+    const innerTmux = `agentskai-${this.id.replaceAll('-', '').slice(0, 16)}`;
+    const args = ['exec', '-it'];
+    if (this.dockerEnvFile) args.push('--env-file', this.dockerEnvFile);
+    args.push('-w', this.config.cwd, this.config.containerName, 'tmux', 'new-session', '-A', '-s', innerTmux, '-c', this.config.cwd, '--', inner.command, ...inner.args);
+    return { command: process.env.AGENTSKAI_DOCKER_BIN ?? 'docker', args };
   }
 
   private spawnTmuxAttach(): SessionProcess {

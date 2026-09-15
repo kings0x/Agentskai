@@ -1,7 +1,7 @@
 import { access, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { Session } from './session.js';
-import { StateStore } from '../persistence/state-store.js';
+import type { PlatformStore } from '../persistence/store.js';
 import { randomUUID } from 'node:crypto';
 import type { Automation, AutomationConfig, SessionConfig, SessionSnapshot } from '../types.js';
 import { normalizeWorkingDirectory } from '../paths.js';
@@ -12,8 +12,11 @@ export class SessionManager {
   private scheduler: NodeJS.Timeout | null = null;
   readonly maxSessions: number;
 
-  constructor(private readonly store: StateStore, options: { maxSessions?: number } = {}) {
+  private readonly prepareRuntime?: (config: SessionConfig, sessionId: string) => Promise<{ dockerEnvFile?: string }>;
+
+  constructor(private readonly store: PlatformStore, options: { maxSessions?: number; prepareRuntime?: (config: SessionConfig, sessionId: string) => Promise<{ dockerEnvFile?: string }> } = {}) {
     this.maxSessions = options.maxSessions ?? Number(process.env.AGENTDOCK_MAX_SESSIONS ?? 20);
+    this.prepareRuntime = options.prepareRuntime;
   }
 
   async load(): Promise<void> {
@@ -57,7 +60,10 @@ export class SessionManager {
     const cwd = normalizeWorkingDirectory(input.cwd);
     await access(cwd, constants.F_OK);
     if (!(await stat(cwd)).isDirectory()) throw new Error('Working directory must be a directory');
-    const session = new Session({ persist: true, recoverOnRestart: true, ...input, cwd });
+    const id = randomUUID();
+    const config = { persist: true, recoverOnRestart: true, ...input, cwd };
+    const runtime = await this.prepareRuntime?.(config, id);
+    const session = new Session(config, { id, ...runtime });
     this.bind(session);
     this.sessions.set(session.id, session);
     this.store.upsert(session.snapshot());
@@ -69,13 +75,12 @@ export class SessionManager {
     try {
       await access(snapshot.cwd, constants.F_OK);
       if (!(await stat(snapshot.cwd)).isDirectory()) return;
-      const session = new Session(
-        { ...snapshot, persist: snapshot.persist !== false, recoverOnRestart: snapshot.recoverOnRestart !== false },
-        { id: snapshot.id, createdAt: snapshot.createdAt, tmuxName: snapshot.tmuxName },
-      );
+      const config = { ...snapshot, persist: snapshot.persist !== false, recoverOnRestart: snapshot.recoverOnRestart !== false };
+      const runtime = await this.prepareRuntime?.(config, snapshot.id);
+      const session = new Session(config, { id: snapshot.id, createdAt: snapshot.createdAt, tmuxName: snapshot.tmuxName, ...runtime });
       this.bind(session);
       this.sessions.set(session.id, session);
-      session.start({ requireExistingTmux: true });
+      session.start({ requireExistingTmux: !snapshot.containerName });
     } catch {
       // Keep the orphaned record visible when its working directory disappeared.
     }
@@ -166,7 +171,7 @@ export class SessionManager {
     }
     let session: Session;
     try {
-      session = await this.create({ name: `${automation.name} · ${new Date().toLocaleString()}`, cwd: automation.cwd, mode: automation.mode, command: automation.command, args: automation.args, automationId: id });
+      session = await this.create({ name: `${automation.name} · ${new Date().toLocaleString()}`, cwd: automation.cwd, mode: automation.mode, command: automation.command, args: automation.args, automationId: id, workspaceId: automation.workspaceId, ownerId: automation.ownerId });
     } catch (error) {
       this.markAutomationFailure(automation, (error as Error).message);
       throw error;
@@ -230,10 +235,9 @@ export class SessionManager {
     if (!snapshot) throw new Error('Session not found');
     const current = this.sessions.get(id);
     if (current && (current.snapshot().status === 'running' || current.snapshot().status === 'starting')) current.stop();
-    const session = new Session(
-      { name: snapshot.name, cwd: snapshot.cwd, mode: snapshot.mode, command: snapshot.command, args: snapshot.args, persist: snapshot.persist, recoverOnRestart: snapshot.recoverOnRestart, automationId: snapshot.automationId },
-      { id: snapshot.id, createdAt: snapshot.createdAt, tmuxName: snapshot.tmuxName },
-    );
+    const config: SessionConfig = { name: snapshot.name, cwd: snapshot.cwd, mode: snapshot.mode, command: snapshot.command, args: snapshot.args, persist: snapshot.persist, recoverOnRestart: snapshot.recoverOnRestart, automationId: snapshot.automationId, workspaceId: snapshot.workspaceId, ownerId: snapshot.ownerId, containerName: snapshot.containerName };
+    const runtime = await this.prepareRuntime?.(config, snapshot.id);
+    const session = new Session(config, { id: snapshot.id, createdAt: snapshot.createdAt, tmuxName: snapshot.tmuxName, ...runtime });
     this.bind(session);
     this.sessions.set(id, session);
     this.store.upsert(session.snapshot());

@@ -10,6 +10,9 @@ export interface SessionConfig {
   persist?: boolean;
   recoverOnRestart?: boolean;
   automationId?: string;
+  workspaceId?: string;
+  ownerId?: string;
+  containerName?: string;
 }
 
 export interface SessionSnapshot extends SessionConfig {
@@ -37,6 +40,8 @@ export interface AutomationConfig {
   runAt?: string;
   intervalMinutes?: number;
   enabled: boolean;
+  workspaceId?: string;
+  ownerId?: string;
 }
 
 export interface Automation extends AutomationConfig {
@@ -63,4 +68,64 @@ export interface AppCapabilities {
   persistenceBackend: 'tmux' | 'none';
   defaultCwd: string;
   maxSessions: number;
+  dockerAvailable: boolean;
+  multiUser: boolean;
+}
+
+export type UserRole = 'admin' | 'member';
+
+export interface UserRecord {
+  id: string;
+  username: string;
+  passwordHash: string;
+  passwordSalt: string;
+  role: UserRole;
+  disabled: boolean;
+  createdAt: string;
+  lastLoginAt: string | null;
+}
+
+export type PublicUser = Omit<UserRecord, 'passwordHash' | 'passwordSalt'>;
+export type WorkspaceExecution = 'docker' | 'host';
+
+export interface Workspace {
+  id: string;
+  ownerId: string;
+  name: string;
+  slug: string;
+  hostPath: string;
+  execution: WorkspaceExecution;
+  containerName: string | null;
+  image: string;
+  cpuLimit: number;
+  memoryMb: number;
+  pidsLimit: number;
+  networkMode: 'bridge' | 'none';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CredentialRecord {
+  id: string;
+  ownerId: string;
+  workspaceId: string;
+  name: string;
+  encryptedValue: string;
+  iv: string;
+  authTag: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CredentialSummary extends Omit<CredentialRecord, 'encryptedValue' | 'iv' | 'authTag'> {}
+
+export interface AuditEvent {
+  id: string;
+  actorId: string | null;
+  action: string;
+  resourceType: string;
+  resourceId: string | null;
+  metadata: Record<string, unknown>;
+  ipAddress: string | null;
+  createdAt: string;
 }

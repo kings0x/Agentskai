@@ -1,0 +1,22 @@
+[Unit]
+Description=AgentSkai self-hosted agent control plane
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentskai
+Group=agentskai
+SupplementaryGroups=docker
+WorkingDirectory=/opt/agentskai
+EnvironmentFile=/etc/agentskai/agentskai.env
+ExecStart=/usr/bin/node /opt/agentskai/dist/server.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agentskai /srv/agentskai/workspaces
+
+[Install]
+WantedBy=multi-user.target

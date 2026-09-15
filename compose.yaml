@@ -1,0 +1,31 @@
+services:
+  agentskai:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - agentskai-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/agentskai/workspaces:/srv/agentskai/workspaces
+    security_opt:
+      - no-new-privileges:true
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      AGENTSKAI_DOMAIN: ${AGENTSKAI_DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - agentskai
+volumes:
+  agentskai-data:
+  caddy-data:
+  caddy-config:

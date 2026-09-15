@@ -24,5 +24,7 @@ await build({
 });
 
 await cp('web/index.html', 'dist/public/index.html');
-await cp('web/styles.css', 'dist/public/styles.css');
+await cp('web/app.html', 'dist/public/app.html');
+await cp('web/landing.css', 'dist/public/landing.css');
+await cp('web/app.css', 'dist/public/app.css');
 await cp('node_modules/@xterm/xterm/css/xterm.css', 'dist/public/xterm.css');

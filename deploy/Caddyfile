@@ -1,0 +1,9 @@
+{$AGENTSKAI_DOMAIN} {
+  encode zstd gzip
+  reverse_proxy agentskai:3000
+  header {
+    X-Content-Type-Options nosniff
+    X-Frame-Options DENY
+    Referrer-Policy no-referrer
+  }
+}

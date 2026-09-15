@@ -1,326 +1,96 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import type { AppCapabilities, Automation, SessionSnapshot } from '../src/types.js';
+import type { AppCapabilities, PublicUser, SessionSnapshot, Workspace, CredentialSummary, AuditEvent } from '../src/types.js';
 
-const get = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
-const sessionsElement = get<HTMLDivElement>('#sessions');
-const automationList = get<HTMLDivElement>('#automations');
-const terminalElement = get<HTMLDivElement>('#terminal');
-const emptyState = get<HTMLDivElement>('#empty-state');
-const sessionName = get<HTMLDivElement>('#session-name');
-const sessionMeta = get<HTMLDivElement>('#session-meta');
-const connectionState = get<HTMLSpanElement>('#connection-state');
-const stopButton = get<HTMLButtonElement>('#stop-session');
-const restartButton = get<HTMLButtonElement>('#restart-session');
-const deleteButton = get<HTMLButtonElement>('#delete-session');
-const logoutButton = get<HTMLButtonElement>('#logout');
-const dialog = get<HTMLDialogElement>('#session-dialog');
-const form = get<HTMLFormElement>('#session-form');
-const modeSelect = form.elements.namedItem('mode') as HTMLSelectElement;
-const automationDialog = get<HTMLDialogElement>('#automation-dialog');
-const automationForm = get<HTMLFormElement>('#automation-form');
-const automationMode = automationForm.elements.namedItem('mode') as HTMLSelectElement;
-const automationSchedule = automationForm.elements.namedItem('schedule') as HTMLSelectElement;
-const authScreen = get<HTMLDivElement>('#auth-screen');
-const loginForm = get<HTMLFormElement>('#login-form');
-const loginError = get<HTMLDivElement>('#login-error');
+type WorkspaceView = Workspace & { container: { exists: boolean; running: boolean; status: string } };
+const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
+const $$ = <T extends Element>(selector: string) => [...document.querySelectorAll<T>(selector)];
+let user: PublicUser | null = null, workspaces: WorkspaceView[] = [], sessions: SessionSnapshot[] = [], selectedSession = localStorage.getItem('agentskai.session'), socket: WebSocket | null = null, setupRequired = false;
 
-const terminal = new Terminal({ cursorBlink: true, fontSize: 14, theme: { background: '#05070d', foreground: '#dbe4f5', cursor: '#72e6a7' }, scrollback: 5000 });
-const fit = new FitAddon();
-terminal.loadAddon(fit);
-terminal.open(terminalElement);
-
-let sessions: SessionSnapshot[] = [];
-let automations: Automation[] = [];
-let selectedId: string | null = localStorage.getItem('agentdock.selectedSession');
-let socket: WebSocket | null = null;
-let reconnectTimer: number | null = null;
-let reconnectAttempt = 0;
-let socketGeneration = 0;
-let capabilities: AppCapabilities | null = null;
+const terminal = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: 'SFMono-Regular,Consolas,monospace', theme: { background: '#03060c', foreground: '#d7e2f7', cursor: '#6395ff', selectionBackground: '#244b8c' }, scrollback: 8000 });
+const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open($('#terminal'));
 
 class ApiError extends Error { constructor(message: string, readonly status: number) { super(message); } }
+function message(value: unknown): string { if (typeof value === 'string') return value; if (value && typeof value === 'object') { const data = value as { error?: unknown; message?: string }; return data.message ?? message(data.error); } return 'Request failed'; }
+async function api<T>(url: string, init: RequestInit = {}): Promise<T> { const headers = new Headers(init.headers); if (init.body) headers.set('content-type', 'application/json'); let response: Response; try { response = await fetch(url, { ...init, headers }); } catch { throw new ApiError('AgentSkai is unreachable', 0); } if (response.status === 401) showAuth(); if (!response.ok) throw new ApiError(message(await response.json().catch(() => ({}))), response.status); return response.status === 204 ? undefined as T : response.json() as Promise<T>; }
+function toast(text: string, kind: 'info'|'error' = 'info'): void { const item = document.createElement('div'); item.className = `toast ${kind}`; item.textContent = text; $('#toast-region').append(item); setTimeout(() => item.remove(), 4500); }
+function showAuth(): void { $('#auth-screen').classList.remove('hidden'); socket?.close(); }
+function hideAuth(): void { $('#auth-screen').classList.add('hidden'); }
+function formError(form: HTMLFormElement, error = ''): void { form.querySelector<HTMLElement>('.form-error')!.textContent = error; }
+function openDialog(id: string): void { $<HTMLDialogElement>(id).showModal(); }
 
-function errorMessage(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (value && typeof value === 'object') {
-    const record = value as { error?: unknown; message?: unknown };
-    if (record.error) return errorMessage(record.error);
-    if (typeof record.message === 'string') return record.message;
+async function authenticate(): Promise<boolean> {
+  const status = await api<{ setupRequired: boolean; authenticated: boolean; user: PublicUser|null }>('/api/auth/status');
+  setupRequired = status.setupRequired; user = status.user;
+  $('#auth-title').textContent = setupRequired ? 'Create your administrator' : 'Welcome back';
+  $('#auth-copy').textContent = setupRequired ? 'Finish securing this AgentSkai instance.' : 'Sign in to your control plane.';
+  if (status.authenticated && user) { hideAuth(); return true; }
+  showAuth(); return false;
+}
+
+async function refresh(): Promise<void> {
+  const [config, workspaceData, sessionData] = await Promise.all([
+    api<{ capabilities: AppCapabilities; user: PublicUser }>('/api/config'), api<{ workspaces: WorkspaceView[] }>('/api/workspaces'), api<{ sessions: SessionSnapshot[] }>('/api/sessions'),
+  ]);
+  user = config.user; workspaces = workspaceData.workspaces; sessions = sessionData.sessions;
+  $('#username').textContent = user.username; $('#user-avatar').textContent = user.username[0]!.toUpperCase(); $('#admin-tab').classList.toggle('hidden', user.role !== 'admin');
+  $('#runtime-status').textContent = config.capabilities.dockerAvailable ? '● Docker connected' : '○ Docker unavailable';
+  $('#workspace-count').textContent = String(workspaces.length); $('#session-count').textContent = String(sessions.filter((item) => ['running','starting'].includes(item.status)).length); $('#docker-state').textContent = config.capabilities.dockerAvailable ? 'Online' : 'Offline';
+  renderWorkspaces(); renderSessions(); fillWorkspaceSelects(); renderSessionHeader();
+}
+
+function renderWorkspaces(): void {
+  const side = $('#workspaces'), cards = $('#workspace-cards'); side.replaceChildren(); cards.replaceChildren();
+  if (!workspaces.length) { cards.innerHTML = '<div class="workspace-card"><h3>No workspaces yet</h3><p>Create a Docker workspace to begin.</p></div>'; return; }
+  for (const workspace of workspaces) {
+    const button = document.createElement('button'); button.className = 'side-item'; button.innerHTML = `<i>◫</i><span><b></b><small></small></span>`; button.querySelector('b')!.textContent = workspace.name; button.querySelector('small')!.textContent = workspace.container.running ? 'Running' : workspace.execution; button.onclick = () => { ($('#credential-workspace') as HTMLSelectElement).value = workspace.id; switchView('overview'); }; side.append(button);
+    const card = document.createElement('article'); card.className = 'workspace-card';
+    const active = workspace.execution === 'host' || workspace.container.running;
+    card.innerHTML = `<header><h3></h3><span class="status ${active?'':'stopped'}">${active?'Running':'Stopped'}</span></header><p></p><dl><div><dt>EXECUTION</dt><dd>${workspace.execution}</dd></div><div><dt>RESOURCES</dt><dd>${workspace.cpuLimit} CPU · ${workspace.memoryMb} MB</dd></div><div><dt>NETWORK</dt><dd>${workspace.networkMode}</dd></div><div><dt>SESSIONS</dt><dd>${sessions.filter(s=>s.workspaceId===workspace.id).length}</dd></div></dl><div class="card-actions"><button class="primary launch">New session</button>${workspace.containerName?`<button class="secondary power">${active?'Stop':'Start'}</button>`:''}<button class="danger remove">Delete</button></div>`;
+    card.querySelector('h3')!.textContent = workspace.name; card.querySelector('p')!.textContent = workspace.hostPath;
+    card.querySelector<HTMLButtonElement>('.launch')!.onclick = () => openSession(workspace.id);
+    card.querySelector<HTMLButtonElement>('.power')?.addEventListener('click', () => void workspacePower(workspace, active ? 'stop' : 'start'));
+    card.querySelector<HTMLButtonElement>('.remove')!.onclick = () => void deleteWorkspace(workspace); cards.append(card);
   }
-  return 'Request failed';
-}
-
-async function api<T>(url: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers);
-  if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-  let response: Response;
-  try { response = await fetch(url, { ...init, headers }); }
-  catch { throw new ApiError('AgentDock is unreachable. Is the WSL server running?', 0); }
-  if (response.status === 401) {
-    authScreen.classList.remove('hidden');
-    socket?.close();
-  }
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new ApiError(errorMessage(body), response.status);
-  }
-  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
-}
-
-function toast(message: string, kind: 'info' | 'error' = 'info'): void {
-  const element = document.createElement('div');
-  element.className = `toast ${kind}`;
-  element.textContent = message;
-  get<HTMLDivElement>('#toast-region').append(element);
-  window.setTimeout(() => element.remove(), 4200);
-}
-
-async function ensureAuth(): Promise<boolean> {
-  try {
-    const status = await api<{ enabled: boolean; authenticated: boolean }>('/api/auth/status');
-    logoutButton.classList.toggle('hidden', !status.enabled);
-    authScreen.classList.toggle('hidden', !status.enabled || status.authenticated);
-    return !status.enabled || status.authenticated;
-  } catch (error) { toast((error as Error).message, 'error'); return false; }
-}
-
-async function loadCapabilities(): Promise<void> {
-  const data = await api<{ capabilities: AppCapabilities }>('/api/config');
-  capabilities = data.capabilities;
-  get('#persistence-status').textContent = capabilities.persistentSessions ? '● tmux persistence ready' : '○ persistence unavailable';
-  const help = capabilities.platform === 'linux' ? 'WSL paths and Windows paths such as C:\\Users\\Admin\\Code are accepted.' : `Default: ${capabilities.defaultCwd}`;
-  get('#cwd-help').textContent = help;
-  const persist = form.elements.namedItem('persist') as HTMLInputElement;
-  persist.disabled = !capabilities.persistentSessions;
-  persist.checked = capabilities.persistentSessions;
-}
-
-async function refreshSessions(): Promise<void> {
-  const data = await api<{ sessions: SessionSnapshot[] }>('/api/sessions');
-  sessions = data.sessions;
-  if (selectedId && !sessions.some((item) => item.id === selectedId)) selectedId = null;
-  if (!selectedId && sessions.length) selectedId = sessions[0]!.id;
-  renderSessions();
-  renderHeader();
-}
-
-async function refreshAutomations(): Promise<void> {
-  automations = (await api<{ automations: Automation[] }>('/api/automations')).automations;
-  renderAutomations();
 }
 
 function renderSessions(): void {
-  sessionsElement.replaceChildren();
-  for (const session of sessions) {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = `session-item${session.id === selectedId ? ' active' : ''}`;
-    const dot = document.createElement('span'); dot.className = `status-dot ${session.status}`;
-    const copy = document.createElement('span'); copy.className = 'session-item-copy';
-    const name = document.createElement('span'); name.className = 'session-item-name'; name.textContent = session.name;
-    const meta = document.createElement('span'); meta.className = 'session-item-meta'; meta.textContent = `${session.mode} · ${session.status}`;
-    copy.append(name, meta); button.append(dot, copy);
-    button.addEventListener('click', () => selectSession(session.id));
-    sessionsElement.append(button);
-  }
+  const list = $('#sessions'); list.replaceChildren();
+  for (const session of sessions) { const button = document.createElement('button'); button.className = `side-item${session.id===selectedSession?' active':''}`; button.innerHTML = `<i class="dot ${session.status}"></i><span><b></b><small></small></span>`; button.querySelector('b')!.textContent = session.name; button.querySelector('small')!.textContent = `${session.mode} · ${session.status}`; button.onclick = () => selectSession(session.id); list.append(button); }
 }
+function fillWorkspaceSelects(): void { for (const select of [$('#credential-workspace') as HTMLSelectElement, $('#session-form select[name=workspaceId]') as HTMLSelectElement]) { const old = select.value; select.replaceChildren(...workspaces.map((w) => new Option(w.name, w.id))); if (workspaces.some(w=>w.id===old)) select.value=old; } }
 
-function renderAutomations(): void {
-  automationList.replaceChildren();
-  for (const automation of automations) {
-    const row = document.createElement('div'); row.className = 'automation-item';
-    const summary = document.createElement('div'); summary.className = 'automation-summary';
-    const name = document.createElement('span'); name.className = 'automation-item-name'; name.textContent = automation.name;
-    const state = document.createElement('span'); state.textContent = automation.enabled ? '●' : '○'; state.title = automation.enabled ? 'Enabled' : 'Paused';
-    summary.append(name, state);
-    const meta = document.createElement('div'); meta.className = 'automation-meta';
-    const next = automation.nextRunAt ? new Date(automation.nextRunAt).toLocaleString() : 'not scheduled';
-    meta.textContent = `${automation.lastRunStatus} · next ${next}`;
-    if (automation.lastError) meta.title = automation.lastError;
-    const actions = document.createElement('div'); actions.className = 'automation-actions';
-    const run = actionButton('Run now', `Run ${automation.name}`, () => void runAutomation(automation.id));
-    run.disabled = automation.lastRunStatus === 'running';
-    const toggle = actionButton(automation.enabled ? 'Pause' : 'Enable', `${automation.enabled ? 'Pause' : 'Enable'} ${automation.name}`, () => void toggleAutomation(automation));
-    const remove = actionButton('Delete', `Delete ${automation.name}`, () => void deleteAutomation(automation));
-    actions.append(run, toggle, remove); row.append(summary, meta, actions); automationList.append(row);
-  }
-}
+function switchView(name: string): void { $$('.view').forEach((view) => view.classList.add('hidden')); $(`#${name}-view`).classList.remove('hidden'); $$('.topbar nav button').forEach((button) => button.classList.toggle('active', button.getAttribute('data-view')===name)); const titles: Record<string,[string,string]> = {overview:['Overview','Your persistent coding workspaces'],terminal:['Terminal','Live session connection'],security:['Secrets','Encrypted workspace environment'],admin:['Administration','Users, audit events, and backups']}; $('#page-title').textContent=titles[name]![0]; $('#page-subtitle').textContent=titles[name]![1]; if(name==='security') void loadCredentials(); if(name==='admin') void loadAdmin(); if(name==='terminal') setTimeout(()=>fit.fit(),0); }
 
-function actionButton(label: string, ariaLabel: string, action: () => void): HTMLButtonElement {
-  const button = document.createElement('button'); button.type = 'button'; button.textContent = label; button.setAttribute('aria-label', ariaLabel); button.addEventListener('click', action); return button;
-}
+function selectSession(id: string): void { selectedSession=id; localStorage.setItem('agentskai.session',id); renderSessions(); renderSessionHeader(); switchView('terminal'); connectTerminal(id); }
+function renderSessionHeader(): void { const session=sessions.find(s=>s.id===selectedSession); const empty=$('#terminal-empty'); if(!session){$('#session-name').textContent='No session selected';$('#session-meta').textContent='Choose or create a session to connect.'; empty.classList.remove('hidden'); for(const id of ['#restart-session','#stop-session','#delete-session']) ($(id) as HTMLButtonElement).disabled=true;return;} $('#session-name').textContent=session.name;$('#session-meta').textContent=`${session.mode} · ${session.status} · ${session.backend}`;empty.classList.add('hidden');($('#stop-session') as HTMLButtonElement).disabled=!['running','starting'].includes(session.status);($('#restart-session') as HTMLButtonElement).disabled=['running','starting'].includes(session.status);($('#delete-session') as HTMLButtonElement).disabled=false; }
+function connectTerminal(id:string):void{socket?.close();terminal.reset();const protocol=location.protocol==='https:'?'wss':'ws';const current=new WebSocket(`${protocol}://${location.host}/api/sessions/${id}/terminal/ws`);socket=current;current.onopen=()=>{fit.fit();current.send(JSON.stringify({type:'resize',cols:terminal.cols,rows:terminal.rows}));};current.onmessage=(event)=>{const msg=JSON.parse(event.data) as {type:string;data?:string;session?:SessionSnapshot};if(msg.type==='snapshot'){terminal.reset();if(msg.data)terminal.write(msg.data);}if(msg.type==='output'&&msg.data)terminal.write(msg.data);if(msg.type==='state'&&msg.session){const index=sessions.findIndex(s=>s.id===msg.session!.id);if(index>=0)sessions[index]=msg.session!;renderSessions();renderSessionHeader();}};}
+terminal.onData((data)=>{if(socket?.readyState===WebSocket.OPEN)socket.send(JSON.stringify({type:'input',data,requestId:crypto.randomUUID()}));}); window.addEventListener('resize',()=>{try{fit.fit();}catch{}});
 
-function selectedSession(): SessionSnapshot | undefined { return sessions.find((item) => item.id === selectedId); }
+function openSession(workspaceId?:string):void{if(!workspaces.length){toast('Create a workspace first','error');openDialog('#workspace-dialog');return;}const select=$('#session-form select[name=workspaceId]') as HTMLSelectElement;if(workspaceId)select.value=workspaceId;openDialog('#session-dialog');}
+function parseArgs(value:string):string[]|undefined{return value.trim()?value.trim().split(/\s+/):undefined;}
+async function submitForm(form:HTMLFormElement, work:()=>Promise<void>):Promise<void>{formError(form);const submit=form.querySelector<HTMLButtonElement>('button:not([type=button])')!;submit.disabled=true;try{await work();form.reset();form.closest('dialog')?.close();}catch(error){formError(form,(error as Error).message);}finally{submit.disabled=false;}}
 
-function renderHeader(): void {
-  const session = selectedSession();
-  if (!session) {
-    sessionName.textContent = 'No session selected'; sessionMeta.textContent = 'Create a session to begin';
-    stopButton.disabled = restartButton.disabled = deleteButton.disabled = true;
-    emptyState.classList.remove('hidden'); connectionState.classList.add('hidden'); return;
-  }
-  sessionName.textContent = session.name;
-  sessionMeta.textContent = `${session.mode} · ${session.cwd} · ${session.status} · ${session.backend}`;
-  const active = session.status === 'running' || session.status === 'starting';
-  stopButton.disabled = !active; restartButton.disabled = active; deleteButton.disabled = false;
-  emptyState.classList.add('hidden');
-}
+async function workspacePower(workspace:WorkspaceView,action:'start'|'stop'){try{await api(`/api/workspaces/${workspace.id}/${action}`,{method:'POST'});toast(`Workspace ${action}ed`);await refresh();}catch(e){toast((e as Error).message,'error');}}
+async function deleteWorkspace(workspace:WorkspaceView){if(!confirm(`Delete “${workspace.name}” and its managed container? Project files are kept.`))return;try{await api(`/api/workspaces/${workspace.id}`,{method:'DELETE'});toast('Workspace removed');await refresh();}catch(e){toast((e as Error).message,'error');}}
+async function sessionAction(action:'stop'|'restart'){if(!selectedSession)return;try{const data=await api<{session:SessionSnapshot}>(`/api/sessions/${selectedSession}/${action}`,{method:'POST'});toast(`Session ${action}ed`);await refresh();if(action==='restart')selectSession(data.session.id);}catch(e){toast((e as Error).message,'error');}}
+async function deleteSession(){const session=sessions.find(s=>s.id===selectedSession);if(!session||!confirm(`Delete “${session.name}”?`))return;try{await api(`/api/sessions/${session.id}`,{method:'DELETE'});selectedSession=null;socket?.close();terminal.reset();await refresh();toast('Session deleted');}catch(e){toast((e as Error).message,'error');}}
 
-function selectSession(id: string): void {
-  if (!sessions.some((item) => item.id === id)) return;
-  selectedId = id; localStorage.setItem('agentdock.selectedSession', id);
-  renderSessions(); renderHeader(); connectTerminal(id);
-}
+async function loadCredentials():Promise<void>{const workspaceId=($('#credential-workspace') as HTMLSelectElement).value;const list=$('#credentials');if(!workspaceId){list.innerHTML='<div class="table-row"><small>Create a workspace first.</small></div>';return;}const data=await api<{credentials:CredentialSummary[]}>(`/api/workspaces/${workspaceId}/credentials`);list.replaceChildren();if(!data.credentials.length)list.innerHTML='<div class="table-row"><small>No secrets configured.</small></div>';for(const c of data.credentials){const row=document.createElement('div');row.className='table-row';row.innerHTML='<b></b><small>Encrypted value</small><small></small><button>Delete</button>';row.querySelector('b')!.textContent=c.name;row.querySelectorAll('small')[1]!.textContent=new Date(c.updatedAt).toLocaleString();row.querySelector('button')!.onclick=async()=>{await api(`/api/credentials/${c.id}`,{method:'DELETE'});await loadCredentials();};list.append(row);}}
+async function loadAdmin():Promise<void>{if(user?.role!=='admin')return;const [usersData,auditData]=await Promise.all([api<{users:PublicUser[]}>('/api/users'),api<{events:AuditEvent[]}>('/api/audit')]);const users=$('#users');users.replaceChildren();for(const item of usersData.users){const row=document.createElement('div');row.className='table-row';row.innerHTML='<b></b><small></small><small></small><span></span>';row.querySelector('b')!.textContent=item.username;row.querySelectorAll('small')[0]!.textContent=item.role;row.querySelectorAll('small')[1]!.textContent=item.lastLoginAt?`Last login ${new Date(item.lastLoginAt).toLocaleDateString()}`:'Never signed in';row.querySelector('span')!.textContent=item.disabled?'Disabled':'Active';users.append(row);}const audit=$('#audit');audit.replaceChildren();for(const event of auditData.events){const row=document.createElement('div');row.className='audit-item';row.innerHTML='<b></b><span></span>';row.querySelector('b')!.textContent=event.action;row.querySelector('span')!.textContent=`${event.resourceType}${event.resourceId?` · ${event.resourceId.slice(0,8)}`:''} · ${new Date(event.createdAt).toLocaleString()}`;audit.append(row);}}
 
-function connectTerminal(id: string): void {
-  socketGeneration += 1; const generation = socketGeneration;
-  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-  socket?.close(); terminal.reset(); reconnectAttempt = 0;
-  openSocket(id, generation);
-}
+$$<HTMLButtonElement>('[data-close]').forEach(button=>button.onclick=()=>button.closest('dialog')?.close());
+$$<HTMLButtonElement>('.topbar nav button').forEach(button=>button.onclick=()=>switchView(button.dataset.view!));
+$('#new-workspace').addEventListener('click',()=>openDialog('#workspace-dialog'));$('#overview-new-workspace').addEventListener('click',()=>openDialog('#workspace-dialog'));$('#new-session').addEventListener('click',()=>openSession());$('#empty-new-session').addEventListener('click',()=>openSession());
+$('#new-credential').addEventListener('click',()=>{if(workspaces.length)openDialog('#credential-dialog');else toast('Create a workspace first','error');});$('#new-user').addEventListener('click',()=>openDialog('#user-dialog'));$('#credential-workspace').addEventListener('change',()=>void loadCredentials());
+($('#session-form select[name=mode]') as HTMLSelectElement).onchange=(event)=>{const custom=(event.target as HTMLSelectElement).value==='custom';$('#custom-command').classList.toggle('hidden',!custom);$('#custom-args').classList.toggle('hidden',!custom);};
+$('#workspace-form').addEventListener('submit',(event)=>{event.preventDefault();const form=event.currentTarget as HTMLFormElement;void submitForm(form,async()=>{const values=new FormData(form);await api('/api/workspaces',{method:'POST',body:JSON.stringify({name:values.get('name'),hostPath:values.get('hostPath'),execution:values.get('execution'),networkMode:values.get('networkMode'),cpuLimit:Number(values.get('cpuLimit')),memoryMb:Number(values.get('memoryMb'))})});toast('Workspace created');await refresh();});});
+$('#session-form').addEventListener('submit',(event)=>{event.preventDefault();const form=event.currentTarget as HTMLFormElement;void submitForm(form,async()=>{const values=new FormData(form);const data=await api<{session:SessionSnapshot}>('/api/sessions',{method:'POST',body:JSON.stringify({name:values.get('name'),workspaceId:values.get('workspaceId'),mode:values.get('mode'),command:String(values.get('command')||'')||undefined,args:parseArgs(String(values.get('args')||'')),persist:values.get('persist')==='on',recoverOnRestart:values.get('persist')==='on'})});toast('Session launched');await refresh();selectSession(data.session.id);});});
+$('#credential-form').addEventListener('submit',(event)=>{event.preventDefault();const form=event.currentTarget as HTMLFormElement;void submitForm(form,async()=>{const values=new FormData(form),workspaceId=($('#credential-workspace') as HTMLSelectElement).value;await api(`/api/workspaces/${workspaceId}/credentials`,{method:'POST',body:JSON.stringify({name:values.get('name'),value:values.get('value')})});toast('Secret encrypted');await loadCredentials();});});
+$('#user-form').addEventListener('submit',(event)=>{event.preventDefault();const form=event.currentTarget as HTMLFormElement;void submitForm(form,async()=>{const values=new FormData(form);await api('/api/users',{method:'POST',body:JSON.stringify(Object.fromEntries(values))});toast('Account created');await loadAdmin();});});
+$('#stop-session').addEventListener('click',()=>void sessionAction('stop'));$('#restart-session').addEventListener('click',()=>void sessionAction('restart'));$('#delete-session').addEventListener('click',()=>void deleteSession());
+$('#create-backup').addEventListener('click',async()=>{try{const data=await api<{backup:{path:string}}>('/api/backups',{method:'POST'});toast(`Backup created: ${data.backup.path}`);}catch(e){toast((e as Error).message,'error');}});
+$('#logout').addEventListener('click',async()=>{await api('/api/auth/logout',{method:'POST'});showAuth();});
+$('#login-form').addEventListener('submit',(event)=>{event.preventDefault();const form=event.currentTarget as HTMLFormElement;formError(form);void (async()=>{try{const body={username:($('#login-username') as HTMLInputElement).value,password:($('#login-password') as HTMLInputElement).value};if(setupRequired)await api('/api/auth/setup',{method:'POST',body:JSON.stringify({...body,role:'admin'})});await api('/api/auth/login',{method:'POST',body:JSON.stringify(body)});($('#login-password') as HTMLInputElement).value='';hideAuth();await refresh();}catch(e){formError(form,(e as Error).message);}})();});
 
-function openSocket(id: string, generation: number): void {
-  if (generation !== socketGeneration || selectedId !== id) return;
-  const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-  connectionState.textContent = reconnectAttempt ? 'Reconnecting…' : 'Connecting…'; connectionState.classList.remove('hidden');
-  const current = new WebSocket(`${protocol}://${location.host}/api/sessions/${id}/terminal/ws`); socket = current;
-  current.onopen = () => { if (generation !== socketGeneration) return; reconnectAttempt = 0; connectionState.classList.add('hidden'); sendResize(); };
-  current.onmessage = (event) => {
-    if (generation !== socketGeneration) return;
-    const message = JSON.parse(event.data) as { type: string; data?: string; session?: SessionSnapshot; message?: string };
-    if (message.type === 'snapshot') { terminal.reset(); if (message.data) terminal.write(message.data); }
-    if (message.type === 'output' && message.data) terminal.write(message.data);
-    if (message.type === 'state' && message.session) {
-      const index = sessions.findIndex((item) => item.id === message.session!.id);
-      if (index >= 0) sessions[index] = message.session!;
-      renderSessions(); renderHeader();
-    }
-    if (message.type === 'error') terminal.writeln(`\r\n[agentdock] ${message.message ?? 'Terminal error'}`);
-  };
-  current.onclose = () => {
-    if (generation !== socketGeneration || selectedId !== id) return;
-    connectionState.textContent = 'Disconnected'; connectionState.classList.remove('hidden');
-    const session = sessions.find((item) => item.id === id);
-    if (session?.status === 'running' || session?.status === 'starting') {
-      const delay = Math.min(10_000, 700 * 2 ** reconnectAttempt++);
-      reconnectTimer = window.setTimeout(() => openSocket(id, generation), delay);
-    }
-  };
-}
-
-function sendResize(): void {
-  try { fit.fit(); } catch { return; }
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }));
-}
-
-function parseArguments(value: string): string[] | undefined {
-  if (!value.trim()) return undefined;
-  const result: string[] = []; let current = ''; let quote = ''; let escaped = false;
-  for (const character of value.trim()) {
-    if (escaped) { current += character; escaped = false; continue; }
-    if (character === '\\' && quote !== "'") { escaped = true; continue; }
-    if ((character === '"' || character === "'") && (!quote || quote === character)) { quote = quote ? '' : character; continue; }
-    if (/\s/.test(character) && !quote) { if (current) { result.push(current); current = ''; } continue; }
-    current += character;
-  }
-  if (quote) throw new Error('Arguments contain an unclosed quote');
-  if (escaped) current += '\\';
-  if (current) result.push(current);
-  return result;
-}
-
-function openSessionDialog(): void {
-  const cwd = form.elements.namedItem('cwd') as HTMLInputElement;
-  if (!cwd.value) cwd.value = capabilities?.defaultCwd ?? '';
-  get('#session-form-error').textContent = '';
-  dialog.showModal();
-}
-
-async function createSession(event: SubmitEvent): Promise<void> {
-  event.preventDefault(); const values = new FormData(form); const submit = get<HTMLButtonElement>('#create-session'); submit.disabled = true;
-  try {
-    const body = { name: String(values.get('name')), cwd: String(values.get('cwd')), mode: String(values.get('mode')), command: String(values.get('command') ?? '') || undefined, args: parseArguments(String(values.get('args') ?? '')), persist: values.get('persist') === 'on', recoverOnRestart: values.get('persist') === 'on' };
-    const data = await api<{ session: SessionSnapshot }>('/api/sessions', { method: 'POST', body: JSON.stringify(body) });
-    dialog.close(); form.reset(); toggleCustomFields(); await refreshSessions(); selectSession(data.session.id); toast('Session launched');
-  } catch (error) { get('#session-form-error').textContent = (error as Error).message; }
-  finally { submit.disabled = false; }
-}
-
-async function sessionAction(action: 'stop' | 'restart'): Promise<void> {
-  if (!selectedId) return;
-  try {
-    const data = await api<{ session: SessionSnapshot }>(`/api/sessions/${selectedId}/${action}`, { method: 'POST' });
-    await refreshSessions(); if (action === 'restart') selectSession(data.session.id); toast(`Session ${action === 'stop' ? 'stopped' : 'restarted'}`);
-  } catch (error) { toast((error as Error).message, 'error'); }
-}
-
-async function deleteSelected(): Promise<void> {
-  const session = selectedSession(); if (!session || !window.confirm(`Delete “${session.name}”? Its running process will be stopped.`)) return;
-  try { await api<void>(`/api/sessions/${session.id}`, { method: 'DELETE' }); selectedId = null; localStorage.removeItem('agentdock.selectedSession'); socketGeneration += 1; socket?.close(); terminal.reset(); await refreshSessions(); if (selectedId) selectSession(selectedId); toast('Session deleted'); }
-  catch (error) { toast((error as Error).message, 'error'); }
-}
-
-function openAutomationDialog(): void {
-  const cwd = automationForm.elements.namedItem('cwd') as HTMLInputElement;
-  if (!cwd.value) cwd.value = capabilities?.defaultCwd ?? '';
-  get('#automation-form-error').textContent = ''; automationDialog.showModal();
-}
-
-async function createAutomation(event: SubmitEvent): Promise<void> {
-  event.preventDefault(); const values = new FormData(automationForm); const schedule = String(values.get('schedule')); const localRunAt = String(values.get('runAt') ?? '');
-  const submit = automationForm.querySelector<HTMLButtonElement>('button[type="submit"], button:not([type])')!; submit.disabled = true;
-  try {
-    const body = { name: String(values.get('name')), cwd: String(values.get('cwd')), mode: String(values.get('mode')), command: String(values.get('command') ?? '') || undefined, args: parseArguments(String(values.get('args') ?? '')), prompt: String(values.get('prompt')), schedule, intervalMinutes: schedule === 'interval' ? Number(values.get('intervalMinutes') ?? 60) : undefined, runAt: localRunAt ? new Date(localRunAt).toISOString() : undefined, enabled: true };
-    await api('/api/automations', { method: 'POST', body: JSON.stringify(body) }); automationDialog.close(); automationForm.reset(); toggleAutomationFields(); await refreshAutomations(); toast('Automation saved');
-  } catch (error) { get('#automation-form-error').textContent = (error as Error).message; }
-  finally { submit.disabled = false; }
-}
-
-async function runAutomation(id: string): Promise<void> {
-  try { const data = await api<{ session: SessionSnapshot }>(`/api/automations/${id}/run`, { method: 'POST' }); await Promise.all([refreshSessions(), refreshAutomations()]); selectSession(data.session.id); toast('Automation started'); }
-  catch (error) { toast((error as Error).message, 'error'); }
-}
-
-async function toggleAutomation(automation: Automation): Promise<void> {
-  try { await api(`/api/automations/${automation.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !automation.enabled }) }); await refreshAutomations(); toast(automation.enabled ? 'Automation paused' : 'Automation enabled'); }
-  catch (error) { toast((error as Error).message, 'error'); }
-}
-
-async function deleteAutomation(automation: Automation): Promise<void> {
-  if (!window.confirm(`Delete automation “${automation.name}”?`)) return;
-  try { await api<void>(`/api/automations/${automation.id}`, { method: 'DELETE' }); await refreshAutomations(); toast('Automation deleted'); }
-  catch (error) { toast((error as Error).message, 'error'); }
-}
-
-function toggleCustomFields(): void {
-  const visible = modeSelect.value === 'custom'; get('#custom-command-label').classList.toggle('hidden', !visible); get('#custom-args-label').classList.toggle('hidden', !visible);
-}
-function toggleAutomationFields(): void {
-  const custom = automationMode.value === 'custom'; get('#automation-command-label').classList.toggle('hidden', !custom); get('#automation-args-label').classList.toggle('hidden', !custom);
-  const once = automationSchedule.value === 'once'; get('#interval-label').classList.toggle('hidden', once); get('#run-at-label').classList.toggle('hidden', !once);
-  const runAt = automationForm.elements.namedItem('runAt') as HTMLInputElement; runAt.required = once;
-  if (once && !runAt.value) { const future = new Date(Date.now() + 3_600_000); future.setMinutes(future.getMinutes() - future.getTimezoneOffset()); runAt.value = future.toISOString().slice(0, 16); }
-}
-
-terminal.onData((data) => { if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'input', data, requestId: crypto.randomUUID() })); });
-window.addEventListener('resize', sendResize);
-get('#new-session').addEventListener('click', openSessionDialog); get('#empty-new-session').addEventListener('click', openSessionDialog);
-get('#close-session-dialog').addEventListener('click', () => dialog.close()); get('#cancel-session-dialog').addEventListener('click', () => dialog.close());
-get('#new-automation').addEventListener('click', openAutomationDialog); get('#close-automation-dialog').addEventListener('click', () => automationDialog.close()); get('#cancel-automation-dialog').addEventListener('click', () => automationDialog.close());
-form.addEventListener('submit', (event) => void createSession(event)); automationForm.addEventListener('submit', (event) => void createAutomation(event));
-modeSelect.addEventListener('change', toggleCustomFields); automationMode.addEventListener('change', toggleAutomationFields); automationSchedule.addEventListener('change', toggleAutomationFields);
-stopButton.addEventListener('click', () => void sessionAction('stop')); restartButton.addEventListener('click', () => void sessionAction('restart')); deleteButton.addEventListener('click', () => void deleteSelected());
-logoutButton.addEventListener('click', async () => { await api('/api/auth/logout', { method: 'POST' }); authScreen.classList.remove('hidden'); socketGeneration += 1; socket?.close(); });
-loginForm.addEventListener('submit', async (event) => { event.preventDefault(); loginError.textContent = ''; try { await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ password: get<HTMLInputElement>('#login-password').value }) }); get<HTMLInputElement>('#login-password').value = ''; authScreen.classList.add('hidden'); await bootstrap(); } catch (error) { loginError.textContent = (error as Error).message; } });
-
-async function bootstrap(): Promise<void> {
-  try {
-    await loadCapabilities(); await Promise.all([refreshSessions(), refreshAutomations()]);
-    if (selectedId) selectSession(selectedId); else renderHeader(); sendResize();
-  } catch (error) { toast((error as Error).message, 'error'); }
-}
-
-toggleCustomFields(); toggleAutomationFields();
-void ensureAuth().then((authenticated) => { if (authenticated) void bootstrap(); });
-window.setInterval(() => { if (authScreen.classList.contains('hidden')) void Promise.all([refreshSessions(), refreshAutomations()]).catch(() => undefined); }, 5000);
+void authenticate().then(ok=>{if(ok)return refresh();}).catch(e=>toast((e as Error).message,'error')); setInterval(()=>{if($('#auth-screen').classList.contains('hidden'))void refresh().catch(()=>undefined);},7000);
