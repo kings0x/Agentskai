@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#080b14" />
+    <title>AgentDock</title>
+    <link rel="stylesheet" href="/xterm.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-mark">◆</span><span>AgentDock</span><span class="version">v1</span></div>
+        <button id="new-session" class="primary-button">＋ New session</button>
+        <div class="sidebar-label">Sessions</div>
+        <div id="sessions" class="session-list"></div>
+        <div class="sidebar-label automation-label">Automations</div>
+        <button id="new-automation" class="secondary-button automation-button">＋ New automation</button>
+        <div id="automations" class="automation-list"></div>
+        <div class="sidebar-footer"><span id="persistence-status">Checking runtime…</span><button id="logout" class="text-button hidden">Sign out</button></div>
+      </aside>
+      <main class="main-panel">
+        <header class="topbar">
+          <div class="session-heading"><div id="session-name" class="session-title">No session selected</div><div id="session-meta" class="session-meta">Create a session to begin</div></div>
+          <div class="topbar-actions"><span id="connection-state" class="connection-pill hidden">Disconnected</span><button id="restart-session" class="secondary-button" disabled>Restart</button><button id="delete-session" class="secondary-button" disabled>Delete</button><button id="stop-session" class="danger-button" disabled>Stop</button></div>
+        </header>
+        <section class="terminal-wrap"><div id="terminal" class="terminal"></div><div id="empty-state" class="empty-state"><div class="empty-icon">⌁</div><h1>Your agents, in one place</h1><p>Start a shell or coding-agent session and keep working from the browser.</p><button id="empty-new-session" class="primary-button">Start a session</button></div></section>
+      </main>
+    </div>
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <div id="auth-screen" class="auth-screen hidden"><form id="login-form" class="login-card"><div class="brand"><span class="brand-mark">◆</span><span>AgentDock</span></div><h1>Sign in</h1><p>This AgentDock instance requires a password.</p><input id="login-password" type="password" placeholder="Password" required autofocus /><button class="primary-button">Continue</button><div id="login-error" class="form-error" aria-live="polite"></div></form></div>
+    <dialog id="session-dialog">
+      <form id="session-form" class="dialog-form">
+        <div class="dialog-header"><div><h2>New session</h2><p>Launch a terminal process in this runtime.</p></div><button type="button" id="close-session-dialog" class="icon-button" aria-label="Close">×</button></div>
+        <label>Name<input name="name" required maxlength="80" placeholder="My project" /></label>
+        <label>Working directory<input name="cwd" required autocomplete="off" /><small id="cwd-help"></small></label>
+        <label>Agent<select name="mode"><option value="shell">Shell</option><option value="claude">Claude Code</option><option value="custom">Custom command</option></select></label>
+        <label id="custom-command-label" class="hidden">Command<input name="command" placeholder="npm" /></label>
+        <label id="custom-args-label" class="hidden">Arguments<input name="args" placeholder="run dev -- --port 4000" /></label>
+        <label class="check-row"><input name="persist" type="checkbox" checked /> Keep alive across AgentDock restarts</label>
+        <div id="session-form-error" class="form-error" aria-live="polite"></div>
+        <div class="dialog-actions"><button type="button" id="cancel-session-dialog" class="secondary-button">Cancel</button><button id="create-session" class="primary-button">Launch session</button></div>
+      </form>
+    </dialog>
+    <dialog id="automation-dialog">
+      <form id="automation-form" class="dialog-form">
+        <div class="dialog-header"><div><h2>New automation</h2><p>Run a command or agent prompt on a schedule.</p></div><button type="button" id="close-automation-dialog" class="icon-button" aria-label="Close">×</button></div>
+        <label>Name<input name="name" required maxlength="80" placeholder="Nightly tests" /></label>
+        <label>Working directory<input name="cwd" required autocomplete="off" /></label>
+        <label>Agent<select name="mode"><option value="claude">Claude Code</option><option value="shell">Shell</option><option value="custom">Custom command</option></select></label>
+        <label id="automation-command-label" class="hidden">Command<input name="command" placeholder="npm" /></label>
+        <label id="automation-args-label" class="hidden">Arguments<input name="args" placeholder="test" /></label>
+        <label>Input to send<textarea name="prompt" required maxlength="10000" rows="4" placeholder="Run the test suite and summarize failures."></textarea></label>
+        <label>Schedule<select name="schedule"><option value="interval">Every interval</option><option value="once">One time</option></select></label>
+        <label id="interval-label">Interval (minutes)<input name="intervalMinutes" type="number" min="1" max="43200" value="60" /></label>
+        <label id="run-at-label" class="hidden">Run at<input name="runAt" type="datetime-local" /></label>
+        <div id="automation-form-error" class="form-error" aria-live="polite"></div>
+        <div class="dialog-actions"><button type="button" id="cancel-automation-dialog" class="secondary-button">Cancel</button><button class="primary-button">Save automation</button></div>
+      </form>
+    </dialog>
+    <script src="/app.js"></script>
+  </body>
+</html>
