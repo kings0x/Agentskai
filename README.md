@@ -28,6 +28,8 @@ wsl.exe -d Ubuntu -- bash -lc 'cd /mnt/c/Users/Admin/Code/agentskai && bash scri
 
 The installer builds `agentskai/workspace:1`, installs an immutable release under `~/.local/share/agentskai`, migrates existing JSON state into SQLite, and restarts the user service. Open <http://127.0.0.1:3000>.
 
+The default workspace image includes a pinned Claude Code CLI. Add `ANTHROPIC_API_KEY` through the workspace Secrets page, or authenticate interactively in a Claude session. Other agent CLIs can be supplied by a custom workspace image or launched as custom commands.
+
 ```bash
 systemctl --user status agentdock
 journalctl --user -u agentdock -f
