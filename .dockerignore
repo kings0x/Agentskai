@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+dist
+data
+.env
+*.log
+*.png
+test-cookie.txt

@@ -2,7 +2,7 @@ services:
   agentskai:
     build: .
     restart: unless-stopped
-    env_file: .env
+    env_file: ${AGENTSKAI_ENV_FILE:-.env}
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
