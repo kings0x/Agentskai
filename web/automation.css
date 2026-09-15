@@ -1,0 +1,16 @@
+dialog textarea {
+  min-height: 96px;
+  border: 1px solid #293957;
+  background: #070c16;
+  color: #e9effc;
+  border-radius: 7px;
+  padding: 10px 11px;
+  outline: 0;
+  resize: vertical;
+  font: inherit;
+}
+
+dialog textarea:focus { border-color: #4c83f5; }
+.automation-card > p { min-height: 32px; white-space: normal; }
+.automation-card .card-actions { margin-top: 14px; }
+.section-head > button { white-space: nowrap; }
