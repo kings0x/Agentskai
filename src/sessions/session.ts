@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import type { SessionConfig, SessionSnapshot, SessionStatus } from '../types.js';
 import { captureTmuxSession, createTmuxSession, killTmuxSession, tmuxAvailable, tmuxSessionExists } from './tmux.js';
 
@@ -30,6 +30,12 @@ function hostCommandFor(config: SessionConfig): { command: string; args: string[
   if (config.mode === 'shell') return defaultShell();
   if (config.mode === 'claude') return { command: process.platform === 'win32' ? 'claude.cmd' : 'claude', args: [] };
   return { command: config.command ?? defaultShell().command, args: config.args ?? [] };
+}
+
+export function killContainerTmux(containerName: string | undefined, sessionId: string): void {
+  if (!containerName) return;
+  const innerTmux = `agentskai-${sessionId.replaceAll('-', '').slice(0, 16)}`;
+  try { execFileSync(process.env.AGENTSKAI_DOCKER_BIN ?? 'docker', ['exec', containerName, 'tmux', 'kill-session', '-t', innerTmux], { stdio: 'ignore', timeout: 5000 }); } catch { /* Container or session may already be gone. */ }
 }
 
 export class Session extends EventEmitter {
@@ -69,8 +75,10 @@ export class Session extends EventEmitter {
         this.process = this.spawnTmuxAttach();
       } else {
         this.backend = 'pty';
-        const pty = require('node-pty') as { spawn: (file: string, args: string[], options: Record<string, unknown>) => SessionProcess };
-        this.process = pty.spawn(command, args, this.ptyOptions());
+        if (process.platform === 'win32') {
+          const pty = require('node-pty') as { spawn: (file: string, args: string[], options: Record<string, unknown>) => SessionProcess };
+          this.process = pty.spawn(command, args, this.ptyOptions());
+        } else this.process = this.spawnScript(command, args);
       }
       this.setStatus('running');
       this.process.onData((data) => {
@@ -116,12 +124,14 @@ export class Session extends EventEmitter {
     this.endedAt ??= new Date().toISOString();
     if (!this.process) {
       this.setStatus('stopped');
+      killContainerTmux(this.config.containerName, this.id);
       return;
     }
     this.setStatus('stopped');
     this.process.kill();
     this.process = null;
     if (this.backend === 'tmux') killTmuxSession(this.tmuxName);
+    killContainerTmux(this.config.containerName, this.id);
   }
 
   /** Drop only AgentDock's attachment, leaving tmux alive for restart recovery. */
@@ -181,6 +191,19 @@ export class Session extends EventEmitter {
       kill: () => { child.kill(); },
     };
     return process;
+  }
+
+  private spawnScript(command: string, args: string[]): SessionProcess {
+    const quote = (value: string) => `'${value.replaceAll("'", `'\"'\"'`)}'`;
+    const child = spawn('script', ['-qefc', [command, ...args].map(quote).join(' '), '/dev/null'], { ...this.ptyOptions(), detached: true }) as ChildProcess;
+    return {
+      pid: child.pid ?? -1,
+      onData: (callback) => { child.stdout?.setEncoding('utf8'); child.stderr?.setEncoding('utf8'); child.stdout?.on('data', callback); child.stderr?.on('data', callback); },
+      onExit: (callback) => child.on('exit', (exitCode) => callback({ exitCode: exitCode ?? 1 })),
+      write: (data) => { child.stdin?.write(data); },
+      resize: () => { /* util-linux script does not expose a portable resize API. */ },
+      kill: () => { child.kill(); },
+    };
   }
 
   private setStatus(status: SessionStatus): void {

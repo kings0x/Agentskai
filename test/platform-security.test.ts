@@ -17,6 +17,8 @@ test('database authentication persists sessions and never exposes password hashe
     assert.equal(await auth.login('member.one', 'wrong-password'), null);
     const login = await auth.login('MEMBER.ONE', 'a-long-secure-password');
     assert.ok(login?.token);
+    const restartedAuth = new PlatformAuth(store, 3600);
+    assert.equal(restartedAuth.userFor({ headers: { cookie: `agentskai_session=${login!.token}` } })?.id, created.id);
     assert.equal(store.getAuthSessionUser(Buffer.from('wrong').toString('hex')), undefined);
   } finally { store.close(); await rm(directory, { recursive: true, force: true }); }
 });

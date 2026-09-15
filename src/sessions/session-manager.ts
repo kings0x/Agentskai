@@ -1,6 +1,6 @@
 import { access, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { Session } from './session.js';
+import { killContainerTmux, Session } from './session.js';
 import type { PlatformStore } from '../persistence/store.js';
 import { randomUUID } from 'node:crypto';
 import type { Automation, AutomationConfig, SessionConfig, SessionSnapshot } from '../types.js';
@@ -96,6 +96,7 @@ export class SessionManager {
       const snapshot = this.getSnapshot(id);
       if (!snapshot) throw new Error('Session not found');
       if (snapshot.tmuxName) killTmuxSession(snapshot.tmuxName);
+      killContainerTmux(snapshot.containerName, snapshot.id);
       const stopped = { ...snapshot, status: 'stopped' as const, pid: null, endedAt: new Date().toISOString() };
       this.store.upsert(stopped);
       return stopped;
@@ -112,6 +113,7 @@ export class SessionManager {
     else {
       const snapshot = this.getSnapshot(id);
       if (snapshot?.tmuxName) killTmuxSession(snapshot.tmuxName);
+      if (snapshot) killContainerTmux(snapshot.containerName, snapshot.id);
     }
     this.sessions.delete(id);
     this.store.remove(id);

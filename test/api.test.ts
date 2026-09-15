@@ -32,6 +32,10 @@ test('API enforces auth, RBAC, origin checks, and security headers', async () =>
     assert.equal(config.statusCode, 200); assert.equal(config.json().capabilities.multiUser, true); assert.equal(config.headers['x-frame-options'], 'DENY');
     const crossOrigin = await app.inject({ method: 'POST', url: '/api/workspaces', headers: { cookie, origin: 'https://evil.example', host: 'agentskai.local' }, payload: { name: 'x', hostPath: directory } });
     assert.equal(crossOrigin.statusCode, 403);
+    await auth.createUser('member.user', 'member-password-long', 'member');
+    const memberLogin = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'member.user', password: 'member-password-long' } });
+    const memberSetCookie = memberLogin.headers['set-cookie']!; const memberCookie = (Array.isArray(memberSetCookie) ? memberSetCookie[0]! : memberSetCookie).split(';')[0]!;
+    assert.equal((await app.inject({ method: 'GET', url: '/api/users', headers: { cookie: memberCookie } })).statusCode, 403);
     assert.ok(store.listAudit(10).some((event) => event.action === 'auth.login'));
   } finally { await app.close(); store.close(); await rm(directory, { recursive: true, force: true }); }
 });

@@ -32,7 +32,10 @@ cp -R "$SOURCE_DIR/src" "$SOURCE_DIR/web" "$SOURCE_DIR/scripts" "$SOURCE_DIR/tes
 cd "$RELEASE_DIR"
 npm ci
 npm run build
-docker build -f "$SOURCE_DIR/docker/workspace.Dockerfile" -t agentskai/workspace:1 "$SOURCE_DIR"
+DOCKER_BUILD_CONFIG="$(mktemp -d)"
+cleanup_build_config() { [[ "$DOCKER_BUILD_CONFIG" == /tmp/* ]] && rm -rf -- "$DOCKER_BUILD_CONFIG"; }
+trap cleanup_build_config EXIT
+docker --config "$DOCKER_BUILD_CONFIG" build -f "$SOURCE_DIR/docker/workspace.Dockerfile" -t agentskai/workspace:1 "$SOURCE_DIR"
 
 TEMP_LINK="$APP_ROOT/.current-$RELEASE_ID"
 ln -s "$RELEASE_DIR" "$TEMP_LINK"
