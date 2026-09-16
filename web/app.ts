@@ -18,7 +18,7 @@ function createTerminalPane(host: HTMLElement): TerminalPane {
     fontWeight: '400',
     fontFamily: '"Cascadia Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace',
     theme: {
-      background: '#0a0b0d', foreground: '#d4d7dd', cursor: '#d7dbe3', cursorAccent: '#0a0b0d',
+      background: '#181818', foreground: '#d4d7dd', cursor: '#d7dbe3', cursorAccent: '#181818',
       selectionBackground: '#3152a866', black: '#15171b', red: '#e06c75', green: '#8ccf7e', yellow: '#e5c07b',
       blue: '#6c91ff', magenta: '#c678dd', cyan: '#56b6c2', white: '#d7dae0', brightBlack: '#5c6370',
     },
