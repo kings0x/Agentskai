@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 
 const baseUrl = process.env.AGENTSKAI_URL ?? 'http://127.0.0.1:3000';
 const username = process.env.AGENTSKAI_USERNAME ?? 'admin';
@@ -39,6 +39,40 @@ async function terminalUntil(id, trigger, expected) {
   });
 }
 
+async function verifyTmuxScrollRecovery(id, tmuxName) {
+  if (!tmuxName || process.platform === 'win32') return false;
+  const wsUrl = `${baseUrl.replace(/^http/, 'ws')}/api/sessions/${id}/terminal/ws`;
+  const socket = new WebSocket(wsUrl, { headers: { Cookie: cookie } });
+  let output = '';
+  socket.on('message', (raw) => {
+    const event = JSON.parse(raw.toString());
+    if (event.type === 'snapshot' || event.type === 'output') output += event.data ?? '';
+  });
+  await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
+  const waitForCount = async (needle, count) => {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (output.split(needle).length - 1 >= count) return;
+      await pause(100);
+    }
+    throw new Error(`Terminal did not emit ${needle} ${count} times. Output: ${output}`);
+  };
+  socket.send(JSON.stringify({ type: 'input', data: 'echo arrow-history-ok\r', requestId: crypto.randomUUID() }));
+  await waitForCount('arrow-history-ok', 2);
+  await pause(100);
+  const baselineOccurrences = output.split('arrow-history-ok').length - 1;
+  socket.send(JSON.stringify({ type: 'input', data: '\u001b[<64;10;5M', requestId: crypto.randomUUID() }));
+  await pause(250);
+  const modeAfterWheel = execFileSync('tmux', ['display-message', '-p', '-t', tmuxName, '#{pane_in_mode}'], { encoding: 'utf8' }).trim();
+  if (modeAfterWheel !== '1') throw new Error(`Wheel input did not enter tmux copy mode (mode=${modeAfterWheel})`);
+  socket.send(JSON.stringify({ type: 'input', data: '\u001b[A\r', requestId: crypto.randomUUID() }));
+  await waitForCount('arrow-history-ok', baselineOccurrences + 2);
+  await pause(100);
+  const modeAfterArrow = execFileSync('tmux', ['display-message', '-p', '-t', tmuxName, '#{pane_in_mode}'], { encoding: 'utf8' }).trim();
+  socket.close();
+  if (modeAfterArrow !== '0') throw new Error(`Arrow input left tmux in copy mode (mode=${modeAfterArrow})`);
+  return true;
+}
+
 try {
   const login = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) });
   cookie = login.response.headers.get('set-cookie')?.split(';')[0] ?? '';
@@ -53,6 +87,7 @@ try {
   const terminalOutput = await terminalUntil(sessionId, { waitFor: 'boot-ok:credential-injection-ok', input: 'echo websocket-input-ok\r' }, 'websocket-input-ok');
   if (!terminalOutput.includes('credential-injection-ok')) throw new Error('Credential injection was not observed');
   const checks = ['login', 'docker workspace', 'encrypted credential injection', 'websocket input', 'audit log'];
+  if (await verifyTmuxScrollRecovery(sessionId, session.body.session.tmuxName)) checks.push('tmux wheel-to-arrow recovery');
   if (restartCommand) {
     execSync(restartCommand, { stdio: 'inherit' }); await waitForHealth();
     await terminalUntil(sessionId, { input: 'echo restart-recovery-ok\r' }, 'restart-recovery-ok');

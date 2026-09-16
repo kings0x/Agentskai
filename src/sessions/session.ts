@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import type { SessionConfig, SessionSnapshot, SessionStatus } from '../types.js';
-import { captureTmuxSession, configureTmuxSession, createTmuxSession, killTmuxSession, tmuxAvailable, tmuxSessionExists } from './tmux.js';
+import { cancelTmuxCopyMode, captureTmuxSession, configureTmuxSession, createTmuxSession, killTmuxSession, tmuxAvailable, tmuxSessionExists } from './tmux.js';
 
 interface SessionProcess {
   pid: number;
@@ -32,6 +32,10 @@ function hostCommandFor(config: SessionConfig): { command: string; args: string[
   return { command: config.command ?? defaultShell().command, args: config.args ?? [] };
 }
 
+export function isTerminalMouseInput(input: string): boolean {
+  return /\x1b\[(?:<\d+;\d+;\d+[mM]|M[\s\S]{3}|\d+;\d+;\d+M)/.test(input);
+}
+
 export function killContainerTmux(containerName: string | undefined, sessionId: string): void {
   if (!containerName) return;
   const innerTmux = `agentskai-${sessionId.replaceAll('-', '').slice(0, 16)}`;
@@ -49,6 +53,7 @@ export class Session extends EventEmitter {
   private backend: 'pty' | 'tmux' = 'pty';
   private readonly tmuxName: string;
   private detaching = false;
+  private tmuxMouseInputPending = false;
   private readonly handledInputIds = new Set<string>();
 
   constructor(readonly config: SessionConfig, options?: { id?: string; createdAt?: string; tmuxName?: string; dockerEnvFile?: string }) {
@@ -104,6 +109,15 @@ export class Session extends EventEmitter {
   write(input: string, requestId?: string): boolean {
     if (!this.process || this.status !== 'running') throw new Error('Session is not running');
     if (requestId && this.handledInputIds.has(requestId)) return false;
+    if (this.backend === 'tmux') {
+      if (isTerminalMouseInput(input)) this.tmuxMouseInputPending = true;
+      else if (this.tmuxMouseInputPending) {
+        // Wheel gestures put tmux into copy mode. Return to the live pane before
+        // forwarding keyboard input so arrows, typing, and paste reach the shell.
+        cancelTmuxCopyMode(this.tmuxName);
+        this.tmuxMouseInputPending = false;
+      }
+    }
     this.process.write(input);
     if (requestId) {
       this.handledInputIds.add(requestId);

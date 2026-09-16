@@ -38,6 +38,14 @@ export function configureTmuxSession(name: string): void {
   }
 }
 
+export function cancelTmuxCopyMode(name: string): void {
+  try {
+    execFileSync('tmux', ['send-keys', '-X', '-t', name, 'cancel'], { stdio: 'ignore', timeout: 2000 });
+  } catch {
+    // The pane was not in copy mode, or the tmux session ended between events.
+  }
+}
+
 export function captureTmuxSession(name: string): string {
   try {
     return execFileSync('tmux', ['capture-pane', '-p', '-S', '-2000', '-t', name], { encoding: 'utf8', timeout: 3000 });
