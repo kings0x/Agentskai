@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import type { SessionConfig, SessionSnapshot, SessionStatus } from '../types.js';
-import { cancelTmuxCopyMode, captureTmuxSession, configureTmuxSession, createTmuxSession, killTmuxSession, tmuxAvailable, tmuxSessionExists } from './tmux.js';
+import { cancelTmuxCopyMode, captureTmuxSession, configureTmuxSession, createTmuxSession, killTmuxSession, scrollTmuxSession, tmuxAvailable, tmuxSessionExists } from './tmux.js';
 
 interface SessionProcess {
   pid: number;
@@ -115,6 +115,7 @@ export class Session extends EventEmitter {
         // Wheel gestures put tmux into copy mode. Return to the live pane before
         // forwarding keyboard input so arrows, typing, and paste reach the shell.
         cancelTmuxCopyMode(this.tmuxName);
+        if (this.config.containerName) cancelTmuxCopyMode(this.innerTmuxName(), this.config.containerName);
         this.tmuxMouseInputPending = false;
       }
     }
@@ -124,6 +125,13 @@ export class Session extends EventEmitter {
       if (this.handledInputIds.size > 2_000) this.handledInputIds.delete(this.handledInputIds.values().next().value!);
     }
     return true;
+  }
+
+  scroll(lines: number): void {
+    if (!this.process || this.status !== 'running' || this.backend !== 'tmux' || !Number.isFinite(lines) || lines === 0) return;
+    this.tmuxMouseInputPending = this.config.containerName
+      ? scrollTmuxSession(this.innerTmuxName(), lines, this.config.containerName)
+      : scrollTmuxSession(this.tmuxName, lines);
   }
 
   resize(cols: number, rows: number): void {
@@ -186,11 +194,15 @@ export class Session extends EventEmitter {
   private commandForRuntime(): { command: string; args: string[] } {
     const inner = hostCommandFor(this.config);
     if (!this.config.containerName) return inner;
-    const innerTmux = `agentskai-${this.id.replaceAll('-', '').slice(0, 16)}`;
+    const innerTmux = this.innerTmuxName();
     const args = ['exec', '-it'];
     if (this.dockerEnvFile) args.push('--env-file', this.dockerEnvFile);
     args.push('-w', this.config.cwd, this.config.containerName, 'tmux', 'new-session', '-A', '-s', innerTmux, '-c', this.config.cwd, '--', inner.command, ...inner.args);
     return { command: process.env.AGENTSKAI_DOCKER_BIN ?? 'docker', args };
+  }
+
+  private innerTmuxName(): string {
+    return `agentskai-${this.id.replaceAll('-', '').slice(0, 16)}`;
   }
 
   private spawnTmuxAttach(): SessionProcess {

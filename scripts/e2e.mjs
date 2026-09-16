@@ -39,7 +39,7 @@ async function terminalUntil(id, trigger, expected) {
   });
 }
 
-async function verifyTmuxScrollRecovery(id, tmuxName) {
+async function verifyTmuxScrollRecovery(id, tmuxName, containerName) {
   if (!tmuxName || process.platform === 'win32') return false;
   const wsUrl = `${baseUrl.replace(/^http/, 'ws')}/api/sessions/${id}/terminal/ws`;
   const socket = new WebSocket(wsUrl, { headers: { Cookie: cookie } });
@@ -49,6 +49,17 @@ async function verifyTmuxScrollRecovery(id, tmuxName) {
     if (event.type === 'snapshot' || event.type === 'output') output += event.data ?? '';
   });
   await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
+  const innerTmux = `agentskai-${id.replaceAll('-', '').slice(0, 16)}`;
+  const tmuxState = (format) => containerName
+    ? execFileSync('docker', ['exec', containerName, 'tmux', 'display-message', '-p', '-t', innerTmux, format], { encoding: 'utf8' }).trim()
+    : execFileSync('tmux', ['display-message', '-p', '-t', tmuxName, format], { encoding: 'utf8' }).trim();
+  const initialState = tmuxState('#{history_size}:#{pane_in_mode}:#{cursor_x}:#{cursor_y}');
+  if (initialState.startsWith('0:')) {
+    socket.send(JSON.stringify({ type: 'scroll', lines: -3 }));
+    await pause(500);
+    const stateAfterEmptyScroll = tmuxState('#{history_size}:#{pane_in_mode}:#{cursor_x}:#{cursor_y}');
+    if (stateAfterEmptyScroll !== initialState) throw new Error(`Scroll with no history changed pane (${initialState} -> ${stateAfterEmptyScroll})`);
+  }
   const waitForCount = async (needle, count) => {
     for (let attempt = 0; attempt < 50; attempt += 1) {
       if (output.split(needle).length - 1 >= count) return;
@@ -56,20 +67,27 @@ async function verifyTmuxScrollRecovery(id, tmuxName) {
     }
     throw new Error(`Terminal did not emit ${needle} ${count} times. Output: ${output}`);
   };
-  socket.send(JSON.stringify({ type: 'input', data: 'echo arrow-history-ok\r', requestId: crypto.randomUUID() }));
+  socket.send(JSON.stringify({ type: 'input', data: "for i in $(seq 1 80); do echo scroll-line-$i; done; echo arrow-history-ok\r", requestId: crypto.randomUUID() }));
+  await waitForCount('scroll-line-80', 2);
   await waitForCount('arrow-history-ok', 2);
   await pause(100);
   const baselineOccurrences = output.split('arrow-history-ok').length - 1;
-  socket.send(JSON.stringify({ type: 'input', data: '\u001b[<64;10;5M', requestId: crypto.randomUUID() }));
-  await pause(250);
-  const modeAfterWheel = execFileSync('tmux', ['display-message', '-p', '-t', tmuxName, '#{pane_in_mode}'], { encoding: 'utf8' }).trim();
-  if (modeAfterWheel !== '1') throw new Error(`Wheel input did not enter tmux copy mode (mode=${modeAfterWheel})`);
+  const historyBeforeScroll = tmuxState('#{history_size}:#{pane_height}:#{alternate_on}:#{pane_in_mode}');
+  socket.send(JSON.stringify({ type: 'scroll', lines: -3 }));
+  await pause(1500);
+  const modeAfterWheel = tmuxState('#{pane_in_mode}');
+  if (modeAfterWheel !== '1') throw new Error(`Semantic scroll did not enter tmux copy mode (mode=${modeAfterWheel}, before=${historyBeforeScroll})`);
   socket.send(JSON.stringify({ type: 'input', data: '\u001b[A\r', requestId: crypto.randomUUID() }));
   await waitForCount('arrow-history-ok', baselineOccurrences + 2);
   await pause(100);
-  const modeAfterArrow = execFileSync('tmux', ['display-message', '-p', '-t', tmuxName, '#{pane_in_mode}'], { encoding: 'utf8' }).trim();
-  socket.close();
+  const modeAfterArrow = tmuxState('#{pane_in_mode}');
   if (modeAfterArrow !== '0') throw new Error(`Arrow input left tmux in copy mode (mode=${modeAfterArrow})`);
+  const beforeBottomScroll = tmuxState('#{pane_in_mode}:#{cursor_x}:#{cursor_y}');
+  socket.send(JSON.stringify({ type: 'scroll', lines: 3 }));
+  await pause(150);
+  const afterBottomScroll = tmuxState('#{pane_in_mode}:#{cursor_x}:#{cursor_y}');
+  socket.close();
+  if (afterBottomScroll !== beforeBottomScroll) throw new Error(`Downward scroll at live prompt changed pane (${beforeBottomScroll} -> ${afterBottomScroll})`);
   return true;
 }
 
@@ -87,7 +105,7 @@ try {
   const terminalOutput = await terminalUntil(sessionId, { waitFor: 'boot-ok:credential-injection-ok', input: 'echo websocket-input-ok\r' }, 'websocket-input-ok');
   if (!terminalOutput.includes('credential-injection-ok')) throw new Error('Credential injection was not observed');
   const checks = ['login', 'docker workspace', 'encrypted credential injection', 'websocket input', 'audit log'];
-  if (await verifyTmuxScrollRecovery(sessionId, session.body.session.tmuxName)) checks.push('tmux wheel-to-arrow recovery');
+  if (await verifyTmuxScrollRecovery(sessionId, session.body.session.tmuxName, workspace.body.workspace.containerName)) checks.push('tmux semantic scrolling and input recovery');
   if (restartCommand) {
     execSync(restartCommand, { stdio: 'inherit' }); await waitForHealth();
     await terminalUntil(sessionId, { input: 'echo restart-recovery-ok\r' }, 'restart-recovery-ok');

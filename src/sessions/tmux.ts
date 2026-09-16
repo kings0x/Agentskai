@@ -38,11 +38,52 @@ export function configureTmuxSession(name: string): void {
   }
 }
 
-export function cancelTmuxCopyMode(name: string): void {
+function tmuxInvocation(containerName?: string): { command: string; prefix: string[] } {
+  return containerName
+    ? { command: process.env.AGENTSKAI_DOCKER_BIN ?? 'docker', prefix: ['exec', containerName, 'tmux'] }
+    : { command: 'tmux', prefix: [] };
+}
+
+export function cancelTmuxCopyMode(name: string, containerName?: string): void {
+  const invocation = tmuxInvocation(containerName);
   try {
-    execFileSync('tmux', ['send-keys', '-X', '-t', name, 'cancel'], { stdio: 'ignore', timeout: 2000 });
+    execFileSync(invocation.command, [...invocation.prefix, 'send-keys', '-X', '-t', name, 'cancel'], { stdio: 'ignore', timeout: 2000 });
   } catch {
     // The pane was not in copy mode, or the tmux session ended between events.
+  }
+}
+
+/** Scroll tmux history without injecting terminal mouse escape sequences. */
+export function scrollTmuxSession(name: string, lines: number, containerName?: string): boolean {
+  const amount = Math.min(50, Math.max(1, Math.abs(Math.trunc(lines))));
+  try {
+    // Keep state inspection, scroll and final-state reporting inside one
+    // process (and one `docker exec` boundary for container workspaces).
+    const script = `
+target=$1
+direction=$2
+amount=$3
+state=$(tmux display-message -p -t "$target" '#{pane_in_mode} #{history_size}') || exit 1
+set -- $state
+mode=$1
+history=$2
+if [ "$direction" = up ]; then
+  if [ "$history" -eq 0 ]; then printf '%s' "$mode"; exit 0; fi
+  if [ "$mode" -eq 0 ]; then tmux copy-mode -e -t "$target"; fi
+  tmux send-keys -X -N "$amount" -t "$target" scroll-up
+else
+  if [ "$mode" -eq 0 ]; then printf '0'; exit 0; fi
+  tmux send-keys -X -N "$amount" -t "$target" scroll-down
+fi
+tmux display-message -p -t "$target" '#{pane_in_mode}'
+`;
+    const args = ['sh', '-c', script, 'agentskai-scroll', name, lines < 0 ? 'up' : 'down', String(amount)];
+    const output = containerName
+      ? execFileSync(process.env.AGENTSKAI_DOCKER_BIN ?? 'docker', ['exec', containerName, ...args], { encoding: 'utf8', timeout: 3000 })
+      : execFileSync(args[0], args.slice(1), { encoding: 'utf8', timeout: 3000 });
+    return output.trim() === '1';
+  } catch {
+    return false;
   }
 }
 

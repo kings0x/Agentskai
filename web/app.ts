@@ -7,7 +7,7 @@ const $ = <T extends Element>(selector: string) => document.querySelector<T>(sel
 const $$ = <T extends Element>(selector: string) => [...document.querySelectorAll<T>(selector)];
 let user: PublicUser | null = null, workspaces: WorkspaceView[] = [], sessions: SessionSnapshot[] = [], automations: Automation[] = [], selectedSession = localStorage.getItem('agentskai.session'), secondarySession = localStorage.getItem('agentskai.secondarySession'), setupRequired = false;
 
-type TerminalPane = { terminal: Terminal; fit: FitAddon; host: HTMLElement; socket: WebSocket | null; sessionId: string | null };
+type TerminalPane = { terminal: Terminal; fit: FitAddon; host: HTMLElement; socket: WebSocket | null; sessionId: string | null; pendingScroll: number; scrollTimer: number | null };
 
 function createTerminalPane(host: HTMLElement): TerminalPane {
   const terminal = new Terminal({
@@ -32,18 +32,23 @@ function createTerminalPane(host: HTMLElement): TerminalPane {
   const fit = new FitAddon();
   terminal.loadAddon(fit);
   terminal.open(host);
-  const pane: TerminalPane = { terminal, fit, host, socket: null, sessionId: null };
+  const pane: TerminalPane = { terminal, fit, host, socket: null, sessionId: null, pendingScroll: 0, scrollTimer: null };
   terminal.onData((data) => {
     if (pane.socket?.readyState === WebSocket.OPEN) pane.socket.send(JSON.stringify({ type: 'input', data, requestId: crypto.randomUUID() }));
   });
   terminal.attachCustomWheelEventHandler((event) => {
-    // tmux mouse mode provides real output scrolling. Outside mouse-aware apps,
-    // own the gesture so xterm never converts a touchpad wheel into Up/Down keys.
-    if (terminal.modes?.mouseTrackingMode && terminal.modes.mouseTrackingMode !== 'none') return true;
     if (event.ctrlKey || event.metaKey) return true;
     const divisor = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 1 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? terminal.rows : 34;
-    const lines = Math.max(1, Math.ceil(Math.abs(event.deltaY) / divisor));
-    terminal.scrollLines(event.deltaY < 0 ? -lines : lines);
+    const lines = Math.min(8, Math.max(1, Math.ceil(Math.abs(event.deltaY) / divisor))) * (event.deltaY < 0 ? -1 : 1);
+    const session = sessions.find((item) => item.id === pane.sessionId);
+    if (session?.backend === 'tmux') {
+      pane.pendingScroll = Math.max(-100, Math.min(100, pane.pendingScroll + lines));
+      if (pane.scrollTimer === null) pane.scrollTimer = window.setTimeout(() => {
+        if (pane.socket?.readyState === WebSocket.OPEN && pane.pendingScroll !== 0) pane.socket.send(JSON.stringify({ type: 'scroll', lines: pane.pendingScroll }));
+        pane.pendingScroll = 0;
+        pane.scrollTimer = null;
+      }, 75);
+    } else terminal.scrollLines(lines);
     event.preventDefault();
     event.stopPropagation();
     return false;
@@ -198,7 +203,9 @@ function fitTerminals(): void {
 
 function connectTerminalPane(pane: TerminalPane, id: string | null): void {
   if (pane.sessionId === id && pane.socket && pane.socket.readyState <= WebSocket.OPEN) { fitPane(pane); return; }
-  pane.socket?.close(); pane.socket=null; pane.sessionId=id; pane.terminal.reset();
+  pane.socket?.close(); pane.socket=null; pane.sessionId=id; pane.pendingScroll=0;
+  if (pane.scrollTimer !== null) { window.clearTimeout(pane.scrollTimer); pane.scrollTimer=null; }
+  pane.terminal.reset();
   if (!id) return;
   const protocol=location.protocol==='https:'?'wss':'ws', current=new WebSocket(`${protocol}://${location.host}/api/sessions/${id}/terminal/ws`); pane.socket=current;
   current.onopen=()=>{if(pane.socket!==current)return;fitPane(pane);sendPaneResize(pane);};
