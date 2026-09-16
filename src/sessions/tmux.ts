@@ -27,6 +27,17 @@ export function createTmuxSession(name: string, cwd: string, command: string, ar
   if (result.status !== 0) throw new Error(result.stderr?.trim() || 'Unable to create tmux session');
 }
 
+export function configureTmuxSession(name: string): void {
+  const commands = [
+    ['set-option', '-t', name, 'mouse', 'on'],
+    ['set-option', '-t', name, 'status', 'off'],
+    ['set-window-option', '-t', name, 'history-limit', '50000'],
+  ];
+  for (const args of commands) {
+    try { execFileSync('tmux', args, { stdio: 'ignore', timeout: 2000 }); } catch { /* Best effort for older tmux versions. */ }
+  }
+}
+
 export function captureTmuxSession(name: string): string {
   try {
     return execFileSync('tmux', ['capture-pane', '-p', '-S', '-2000', '-t', name], { encoding: 'utf8', timeout: 3000 });

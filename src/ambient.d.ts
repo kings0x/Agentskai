@@ -16,12 +16,16 @@ declare module '@xterm/xterm' {
   export class Terminal {
     cols: number;
     rows: number;
+    modes?: { mouseTrackingMode?: string };
     constructor(options?: Record<string, unknown>);
     loadAddon(addon: unknown): void;
     open(element: HTMLElement): void;
+    focus(): void;
     reset(): void;
+    scrollLines(amount: number): void;
     write(data: string): void;
     writeln(data: string): void;
+    attachCustomWheelEventHandler(callback: (event: WheelEvent) => boolean): void;
     onData(callback: (data: string) => void): IDisposable;
   }
 }

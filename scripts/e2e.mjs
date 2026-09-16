@@ -3,7 +3,7 @@ import { execSync } from 'node:child_process';
 
 const baseUrl = process.env.AGENTSKAI_URL ?? 'http://127.0.0.1:3000';
 const username = process.env.AGENTSKAI_USERNAME ?? 'admin';
-const password = process.env.AGENTSKAI_PASSWORD;
+const password = process.env.AGENTSKAI_PASSWORD ?? process.env.AGENTDOCK_PASSWORD;
 const workspacePath = process.env.AGENTSKAI_E2E_PATH;
 const restartCommand = process.env.AGENTSKAI_RESTART_COMMAND;
 if (!password || !workspacePath) throw new Error('Set AGENTSKAI_PASSWORD and AGENTSKAI_E2E_PATH');

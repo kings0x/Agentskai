@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import type { SessionConfig, SessionSnapshot, SessionStatus } from '../types.js';
-import { captureTmuxSession, createTmuxSession, killTmuxSession, tmuxAvailable, tmuxSessionExists } from './tmux.js';
+import { captureTmuxSession, configureTmuxSession, createTmuxSession, killTmuxSession, tmuxAvailable, tmuxSessionExists } from './tmux.js';
 
 interface SessionProcess {
   pid: number;
@@ -70,6 +70,7 @@ export class Session extends EventEmitter {
           if (options.requireExistingTmux) throw new Error('The persistent tmux session no longer exists');
           createTmuxSession(this.tmuxName, this.config.cwd, command, args);
         }
+        configureTmuxSession(this.tmuxName);
         this.backend = 'tmux';
         this.outputBuffer = captureTmuxSession(this.tmuxName).slice(-200_000);
         this.process = this.spawnTmuxAttach();

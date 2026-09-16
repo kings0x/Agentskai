@@ -5,16 +5,61 @@ import type { AppCapabilities, PublicUser, SessionSnapshot, Workspace, Credentia
 type WorkspaceView = Workspace & { container: { exists: boolean; running: boolean; status: string } };
 const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
 const $$ = <T extends Element>(selector: string) => [...document.querySelectorAll<T>(selector)];
-let user: PublicUser | null = null, workspaces: WorkspaceView[] = [], sessions: SessionSnapshot[] = [], automations: Automation[] = [], selectedSession = localStorage.getItem('agentskai.session'), socket: WebSocket | null = null, setupRequired = false;
+let user: PublicUser | null = null, workspaces: WorkspaceView[] = [], sessions: SessionSnapshot[] = [], automations: Automation[] = [], selectedSession = localStorage.getItem('agentskai.session'), secondarySession = localStorage.getItem('agentskai.secondarySession'), setupRequired = false;
 
-const terminal = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: 'SFMono-Regular,Consolas,monospace', theme: { background: '#03060c', foreground: '#d7e2f7', cursor: '#6395ff', selectionBackground: '#244b8c' }, scrollback: 8000 });
-const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open($('#terminal'));
+type TerminalPane = { terminal: Terminal; fit: FitAddon; host: HTMLElement; socket: WebSocket | null; sessionId: string | null };
+
+function createTerminalPane(host: HTMLElement): TerminalPane {
+  const terminal = new Terminal({
+    cursorBlink: true,
+    cursorStyle: 'block',
+    fontSize: 13,
+    lineHeight: 1.18,
+    fontWeight: '400',
+    fontFamily: '"Cascadia Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace',
+    theme: {
+      background: '#0a0b0d', foreground: '#d4d7dd', cursor: '#d7dbe3', cursorAccent: '#0a0b0d',
+      selectionBackground: '#3152a866', black: '#15171b', red: '#e06c75', green: '#8ccf7e', yellow: '#e5c07b',
+      blue: '#6c91ff', magenta: '#c678dd', cyan: '#56b6c2', white: '#d7dae0', brightBlack: '#5c6370',
+    },
+    minimumContrastRatio: 4.5,
+    rightClickSelectsWord: true,
+    scrollback: 15000,
+    scrollOnUserInput: true,
+    scrollSensitivity: 1,
+    fastScrollSensitivity: 3,
+  });
+  const fit = new FitAddon();
+  terminal.loadAddon(fit);
+  terminal.open(host);
+  const pane: TerminalPane = { terminal, fit, host, socket: null, sessionId: null };
+  terminal.onData((data) => {
+    if (pane.socket?.readyState === WebSocket.OPEN) pane.socket.send(JSON.stringify({ type: 'input', data, requestId: crypto.randomUUID() }));
+  });
+  terminal.attachCustomWheelEventHandler((event) => {
+    // tmux mouse mode provides real output scrolling. Outside mouse-aware apps,
+    // own the gesture so xterm never converts a touchpad wheel into Up/Down keys.
+    if (terminal.modes?.mouseTrackingMode && terminal.modes.mouseTrackingMode !== 'none') return true;
+    if (event.ctrlKey || event.metaKey) return true;
+    const divisor = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 1 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? terminal.rows : 34;
+    const lines = Math.max(1, Math.ceil(Math.abs(event.deltaY) / divisor));
+    terminal.scrollLines(event.deltaY < 0 ? -lines : lines);
+    event.preventDefault();
+    event.stopPropagation();
+    return false;
+  });
+  return pane;
+}
+
+const primaryPane = createTerminalPane($('#terminal-primary'));
+const secondaryPane = createTerminalPane($('#terminal-secondary'));
+const terminalPanes = [primaryPane, secondaryPane];
 
 class ApiError extends Error { constructor(message: string, readonly status: number) { super(message); } }
 function message(value: unknown): string { if (typeof value === 'string') return value; if (value && typeof value === 'object') { const data = value as { error?: unknown; message?: string }; return data.message ?? message(data.error); } return 'Request failed'; }
 async function api<T>(url: string, init: RequestInit = {}): Promise<T> { const headers = new Headers(init.headers); if (init.body) headers.set('content-type', 'application/json'); let response: Response; try { response = await fetch(url, { ...init, headers }); } catch { throw new ApiError('AgentSkai is unreachable', 0); } if (response.status === 401) showAuth(); if (!response.ok) throw new ApiError(message(await response.json().catch(() => ({}))), response.status); return response.status === 204 ? undefined as T : response.json() as Promise<T>; }
 function toast(text: string, kind: 'info'|'error' = 'info'): void { const item = document.createElement('div'); item.className = `toast ${kind}`; item.textContent = text; $('#toast-region').append(item); setTimeout(() => item.remove(), 4500); }
-function showAuth(): void { $('#auth-screen').classList.remove('hidden'); socket?.close(); }
+function showAuth(): void { $('#auth-screen').classList.remove('hidden'); terminalPanes.forEach((pane) => pane.socket?.close()); }
 function hideAuth(): void { $('#auth-screen').classList.add('hidden'); }
 function formError(form: HTMLFormElement, error = ''): void { form.querySelector<HTMLElement>('.form-error')!.textContent = error; }
 function openDialog(id: string): void { $<HTMLDialogElement>(id).showModal(); }
@@ -36,7 +81,11 @@ async function refresh(): Promise<void> {
   $('#username').textContent = user.username; $('#user-avatar').textContent = user.username[0]!.toUpperCase(); $('#admin-tab').classList.toggle('hidden', user.role !== 'admin');
   $('#runtime-status').textContent = config.capabilities.dockerAvailable ? '● Docker connected' : '○ Docker unavailable';
   $('#workspace-count').textContent = String(workspaces.length); $('#session-count').textContent = String(sessions.filter((item) => ['running','starting'].includes(item.status)).length); $('#docker-state').textContent = config.capabilities.dockerAvailable ? 'Online' : 'Offline';
-  renderWorkspaces(); renderSessions(); renderAutomations(); fillWorkspaceSelects(); renderSessionHeader();
+  if (selectedSession && !sessions.some((item) => item.id === selectedSession)) selectedSession = null;
+  if (secondarySession && !sessions.some((item) => item.id === secondarySession)) closeSplit();
+  renderWorkspaces(); renderSessions(); renderTerminalTabs(); renderAutomations(); fillWorkspaceSelects(); fillSecondarySessions(); renderSessionHeader();
+  if (selectedSession) connectTerminalPane(primaryPane, selectedSession);
+  if (!$('#secondary-terminal-pane').classList.contains('hidden') && secondarySession) connectTerminalPane(secondaryPane, secondarySession);
 }
 
 function renderWorkspaces(): void {
@@ -59,6 +108,33 @@ function renderSessions(): void {
   for (const session of sessions) { const button = document.createElement('button'); button.className = `side-item${session.id===selectedSession?' active':''}`; button.innerHTML = `<i class="dot ${session.status}"></i><span><b></b><small></small></span>`; button.querySelector('b')!.textContent = session.name; button.querySelector('small')!.textContent = `${session.mode} · ${session.status}`; button.onclick = () => selectSession(session.id); list.append(button); }
 }
 
+function renderTerminalTabs(): void {
+  const tabs = $('#terminal-tabs'); tabs.replaceChildren();
+  for (const session of sessions) {
+    const button = document.createElement('button');
+    button.className = `terminal-tab${session.id === selectedSession ? ' active' : ''}`;
+    button.setAttribute('role', 'tab'); button.setAttribute('aria-selected', String(session.id === selectedSession));
+    button.title = `${session.name} — ${session.mode} · ${session.status}`;
+    button.innerHTML = `<i class="agent-mark ${session.mode}"></i><b></b><span class="tab-state ${session.status}"></span>`;
+    button.querySelector('b')!.textContent = session.name;
+    button.onclick = () => selectSession(session.id);
+    tabs.append(button);
+  }
+  if (!sessions.length) {
+    const label = document.createElement('span'); label.className = 'terminal-tab active'; label.textContent = 'No open sessions'; tabs.append(label);
+  }
+}
+
+function fillSecondarySessions(): void {
+  const select = $('#secondary-session') as HTMLSelectElement;
+  const candidates = sessions.filter((item) => item.id !== selectedSession);
+  select.replaceChildren(...candidates.map((item) => new Option(`${item.name} · ${item.mode}`, item.id)));
+  if (secondarySession && candidates.some((item) => item.id === secondarySession)) select.value = secondarySession;
+  else secondarySession = candidates[0]?.id ?? null;
+  ($('#split-terminal') as HTMLButtonElement).disabled = sessions.length < 2;
+  renderSecondaryChrome();
+}
+
 function renderAutomations(): void {
   const list = $('#automations'); list.replaceChildren();
   if (!automations.length) { list.innerHTML = '<div class="workspace-card"><h3>No automations yet</h3><p>Schedule a recurring agent task or one-time command.</p></div>'; return; }
@@ -76,12 +152,81 @@ function renderAutomations(): void {
 }
 function fillWorkspaceSelects(): void { for (const select of [$('#credential-workspace') as HTMLSelectElement, $('#session-form select[name=workspaceId]') as HTMLSelectElement, $('#automation-form select[name=workspaceId]') as HTMLSelectElement]) { const old = select.value; select.replaceChildren(...workspaces.map((w) => new Option(w.name, w.id))); if (workspaces.some(w=>w.id===old)) select.value=old; } }
 
-function switchView(name: string): void { $$('.view').forEach((view) => view.classList.add('hidden')); $(`#${name}-view`).classList.remove('hidden'); $$('.topbar nav button').forEach((button) => button.classList.toggle('active', button.getAttribute('data-view')===name)); const titles: Record<string,[string,string]> = {overview:['Overview','Your persistent coding workspaces'],terminal:['Terminal','Live session connection'],automations:['Automations','Scheduled prompts and commands'],security:['Secrets','Encrypted workspace environment'],admin:['Administration','Users, audit events, and backups']}; $('#page-title').textContent=titles[name]![0]; $('#page-subtitle').textContent=titles[name]![1]; if(name==='security') void loadCredentials(); if(name==='admin') void loadAdmin(); if(name==='terminal') setTimeout(()=>fit.fit(),0); }
+function switchView(name: string): void { $$('.view').forEach((view) => view.classList.add('hidden')); $(`#${name}-view`).classList.remove('hidden'); $$('.topbar nav button').forEach((button) => button.classList.toggle('active', button.getAttribute('data-view')===name)); const titles: Record<string,[string,string]> = {overview:['Overview','Your persistent coding workspaces'],terminal:['Terminal','Multi-session cloud workbench'],automations:['Automations','Scheduled prompts and commands'],security:['Secrets','Encrypted workspace environment'],admin:['Administration','Users, audit events, and backups']}; $('#page-title').textContent=titles[name]![0]; $('#page-subtitle').textContent=titles[name]![1]; if(name==='security') void loadCredentials(); if(name==='admin') void loadAdmin(); if(name==='terminal') setTimeout(fitTerminals,0); }
 
-function selectSession(id: string): void { selectedSession=id; localStorage.setItem('agentskai.session',id); renderSessions(); renderSessionHeader(); switchView('terminal'); connectTerminal(id); }
-function renderSessionHeader(): void { const session=sessions.find(s=>s.id===selectedSession); const empty=$('#terminal-empty'); if(!session){$('#session-name').textContent='No session selected';$('#session-meta').textContent='Choose or create a session to connect.'; empty.classList.remove('hidden'); for(const id of ['#restart-session','#stop-session','#delete-session']) ($(id) as HTMLButtonElement).disabled=true;return;} $('#session-name').textContent=session.name;$('#session-meta').textContent=`${session.mode} · ${session.status} · ${session.backend}`;empty.classList.add('hidden');($('#stop-session') as HTMLButtonElement).disabled=!['running','starting'].includes(session.status);($('#restart-session') as HTMLButtonElement).disabled=['running','starting'].includes(session.status);($('#delete-session') as HTMLButtonElement).disabled=false; }
-function connectTerminal(id:string):void{socket?.close();terminal.reset();const protocol=location.protocol==='https:'?'wss':'ws';const current=new WebSocket(`${protocol}://${location.host}/api/sessions/${id}/terminal/ws`);socket=current;current.onopen=()=>{fit.fit();current.send(JSON.stringify({type:'resize',cols:terminal.cols,rows:terminal.rows}));};current.onmessage=(event)=>{const msg=JSON.parse(event.data) as {type:string;data?:string;session?:SessionSnapshot};if(msg.type==='snapshot'){terminal.reset();if(msg.data)terminal.write(msg.data);}if(msg.type==='output'&&msg.data)terminal.write(msg.data);if(msg.type==='state'&&msg.session){const index=sessions.findIndex(s=>s.id===msg.session!.id);if(index>=0)sessions[index]=msg.session!;renderSessions();renderSessionHeader();}};}
-terminal.onData((data)=>{if(socket?.readyState===WebSocket.OPEN)socket.send(JSON.stringify({type:'input',data,requestId:crypto.randomUUID()}));}); window.addEventListener('resize',()=>{try{fit.fit();}catch{}});
+function selectSession(id: string): void {
+  const previous = selectedSession;
+  if (!$('#secondary-terminal-pane').classList.contains('hidden') && secondarySession === id && previous && previous !== id) {
+    secondarySession = previous; localStorage.setItem('agentskai.secondarySession', previous); connectTerminalPane(secondaryPane, previous);
+  }
+  selectedSession=id; localStorage.setItem('agentskai.session',id);
+  renderSessions(); renderTerminalTabs(); fillSecondarySessions(); renderSessionHeader(); switchView('terminal'); connectTerminalPane(primaryPane, id);
+}
+
+function renderSessionHeader(): void {
+  const session=sessions.find(s=>s.id===selectedSession), empty=$('#terminal-empty');
+  const primaryStatus = $('#primary-terminal-pane .pane-status');
+  if(!session){
+    $('#session-name').textContent='No session selected'; $('#session-meta').textContent='Choose or create a session to connect.'; $('#primary-pane-name').textContent='Terminal';
+    primaryStatus.className='pane-status'; empty.classList.remove('hidden');
+    for(const id of ['#restart-session','#stop-session','#delete-session']) ($(id) as HTMLButtonElement).disabled=true;
+    return;
+  }
+  $('#session-name').textContent=session.name; $('#session-meta').textContent=`${session.mode} · ${session.status} · ${session.backend}`; $('#primary-pane-name').textContent=session.name;
+  primaryStatus.className=`pane-status ${session.status}`; empty.classList.add('hidden');
+  ($('#stop-session') as HTMLButtonElement).disabled=!['running','starting'].includes(session.status); ($('#restart-session') as HTMLButtonElement).disabled=['running','starting'].includes(session.status); ($('#delete-session') as HTMLButtonElement).disabled=false;
+}
+
+function renderSecondaryChrome(): void {
+  const session = sessions.find((item) => item.id === secondarySession);
+  const status = $('#secondary-terminal-pane .pane-status'); status.className = `pane-status ${session?.status ?? ''}`;
+}
+
+function sendPaneResize(pane: TerminalPane): void {
+  if (pane.socket?.readyState === WebSocket.OPEN) pane.socket.send(JSON.stringify({type:'resize',cols:pane.terminal.cols,rows:pane.terminal.rows}));
+}
+
+function fitPane(pane: TerminalPane): void {
+  if (!pane.host.offsetParent) return;
+  try { pane.fit.fit(); sendPaneResize(pane); } catch { /* Hidden or not laid out yet. */ }
+}
+
+function fitTerminals(): void {
+  terminalPanes.forEach(fitPane);
+  $('#terminal-dimensions').textContent = primaryPane.sessionId ? `${primaryPane.terminal.cols} × ${primaryPane.terminal.rows}` : '—';
+}
+
+function connectTerminalPane(pane: TerminalPane, id: string | null): void {
+  if (pane.sessionId === id && pane.socket && pane.socket.readyState <= WebSocket.OPEN) { fitPane(pane); return; }
+  pane.socket?.close(); pane.socket=null; pane.sessionId=id; pane.terminal.reset();
+  if (!id) return;
+  const protocol=location.protocol==='https:'?'wss':'ws', current=new WebSocket(`${protocol}://${location.host}/api/sessions/${id}/terminal/ws`); pane.socket=current;
+  current.onopen=()=>{if(pane.socket!==current)return;fitPane(pane);sendPaneResize(pane);};
+  current.onmessage=(event)=>{
+    if(pane.socket!==current)return;
+    const msg=JSON.parse(event.data) as {type:string;data?:string;session?:SessionSnapshot};
+    if(msg.type==='snapshot'){pane.terminal.reset();if(msg.data)pane.terminal.write(msg.data);}
+    if(msg.type==='output'&&msg.data)pane.terminal.write(msg.data);
+    if(msg.type==='state'&&msg.session){const index=sessions.findIndex(s=>s.id===msg.session!.id);if(index>=0)sessions[index]=msg.session!;renderSessions();renderTerminalTabs();renderSessionHeader();renderSecondaryChrome();}
+  };
+  current.onclose=()=>{if(pane.socket===current)pane.socket=null;};
+}
+
+function openSplit(): void {
+  const candidates=sessions.filter((item)=>item.id!==selectedSession);
+  if(!candidates.length){toast('Start another session before splitting the terminal','error');openSession();return;}
+  if(!secondarySession||!candidates.some((item)=>item.id===secondarySession))secondarySession=candidates[0]!.id;
+  localStorage.setItem('agentskai.secondarySession',secondarySession); ($('#secondary-session') as HTMLSelectElement).value=secondarySession;
+  $('#secondary-terminal-pane').classList.remove('hidden'); $('#terminal-grid').classList.add('split'); renderSecondaryChrome(); connectTerminalPane(secondaryPane,secondarySession); setTimeout(fitTerminals,0);
+}
+
+function closeSplit(): void {
+  secondarySession=null; localStorage.removeItem('agentskai.secondarySession'); connectTerminalPane(secondaryPane,null);
+  $('#secondary-terminal-pane').classList.add('hidden'); $('#terminal-grid').classList.remove('split'); setTimeout(fitTerminals,0);
+}
+
+window.addEventListener('resize',fitTerminals);
+new ResizeObserver(()=>fitTerminals()).observe($('#terminal-grid'));
 
 function openSession(workspaceId?:string):void{if(!workspaces.length){toast('Create a workspace first','error');openDialog('#workspace-dialog');return;}const select=$('#session-form select[name=workspaceId]') as HTMLSelectElement;if(workspaceId)select.value=workspaceId;openDialog('#session-dialog');}
 function parseArgs(value:string):string[]|undefined{return value.trim()?value.trim().split(/\s+/):undefined;}
@@ -90,7 +235,7 @@ async function submitForm(form:HTMLFormElement, work:()=>Promise<void>):Promise<
 async function workspacePower(workspace:WorkspaceView,action:'start'|'stop'){try{await api(`/api/workspaces/${workspace.id}/${action}`,{method:'POST'});toast(`Workspace ${action}ed`);await refresh();}catch(e){toast((e as Error).message,'error');}}
 async function deleteWorkspace(workspace:WorkspaceView){if(!confirm(`Delete “${workspace.name}” and its managed container? Project files are kept.`))return;try{await api(`/api/workspaces/${workspace.id}`,{method:'DELETE'});toast('Workspace removed');await refresh();}catch(e){toast((e as Error).message,'error');}}
 async function sessionAction(action:'stop'|'restart'){if(!selectedSession)return;try{const data=await api<{session:SessionSnapshot}>(`/api/sessions/${selectedSession}/${action}`,{method:'POST'});toast(`Session ${action}ed`);await refresh();if(action==='restart')selectSession(data.session.id);}catch(e){toast((e as Error).message,'error');}}
-async function deleteSession(){const session=sessions.find(s=>s.id===selectedSession);if(!session||!confirm(`Delete “${session.name}”?`))return;try{await api(`/api/sessions/${session.id}`,{method:'DELETE'});selectedSession=null;socket?.close();terminal.reset();await refresh();toast('Session deleted');}catch(e){toast((e as Error).message,'error');}}
+async function deleteSession(){const session=sessions.find(s=>s.id===selectedSession);if(!session||!confirm(`Delete “${session.name}”?`))return;try{await api(`/api/sessions/${session.id}`,{method:'DELETE'});const promoted=$('#secondary-terminal-pane').classList.contains('hidden')?null:secondarySession;closeSplit();selectedSession=promoted;if(promoted)localStorage.setItem('agentskai.session',promoted);else localStorage.removeItem('agentskai.session');connectTerminalPane(primaryPane,null);await refresh();toast('Session deleted');}catch(e){toast((e as Error).message,'error');}}
 async function runAutomation(id:string){try{const data=await api<{session:SessionSnapshot}>(`/api/automations/${id}/run`,{method:'POST'});await refresh();selectSession(data.session.id);toast('Automation started');}catch(e){toast((e as Error).message,'error');}}
 async function toggleAutomation(automation:Automation){try{await api(`/api/automations/${automation.id}`,{method:'PATCH',body:JSON.stringify({enabled:!automation.enabled})});await refresh();toast(automation.enabled?'Automation paused':'Automation enabled');}catch(e){toast((e as Error).message,'error');}}
 async function deleteAutomation(automation:Automation){if(!confirm(`Delete “${automation.name}”?`))return;try{await api(`/api/automations/${automation.id}`,{method:'DELETE'});await refresh();toast('Automation deleted');}catch(e){toast((e as Error).message,'error');}}
@@ -100,7 +245,9 @@ async function loadAdmin():Promise<void>{if(user?.role!=='admin')return;const [u
 
 $$<HTMLButtonElement>('[data-close]').forEach(button=>button.onclick=()=>button.closest('dialog')?.close());
 $$<HTMLButtonElement>('.topbar nav button').forEach(button=>button.onclick=()=>switchView(button.dataset.view!));
-$('#new-workspace').addEventListener('click',()=>openDialog('#workspace-dialog'));$('#overview-new-workspace').addEventListener('click',()=>openDialog('#workspace-dialog'));$('#new-session').addEventListener('click',()=>openSession());$('#empty-new-session').addEventListener('click',()=>openSession());
+$('#new-workspace').addEventListener('click',()=>openDialog('#workspace-dialog'));$('#overview-new-workspace').addEventListener('click',()=>openDialog('#workspace-dialog'));$('#new-session').addEventListener('click',()=>openSession());$('#terminal-new-session').addEventListener('click',()=>openSession());$('#empty-new-session').addEventListener('click',()=>openSession());
+$('#split-terminal').addEventListener('click',openSplit);$('#close-split').addEventListener('click',closeSplit);
+$('#secondary-session').addEventListener('change',(event)=>{secondarySession=(event.target as HTMLSelectElement).value;localStorage.setItem('agentskai.secondarySession',secondarySession);renderSecondaryChrome();connectTerminalPane(secondaryPane,secondarySession);setTimeout(fitTerminals,0);});
 $('#new-credential').addEventListener('click',()=>{if(workspaces.length)openDialog('#credential-dialog');else toast('Create a workspace first','error');});$('#new-user').addEventListener('click',()=>openDialog('#user-dialog'));$('#credential-workspace').addEventListener('change',()=>void loadCredentials());
 $('#new-automation').addEventListener('click',()=>{if(workspaces.length)openDialog('#automation-dialog');else toast('Create a workspace first','error');});
 ($('#session-form select[name=mode]') as HTMLSelectElement).onchange=(event)=>{const custom=(event.target as HTMLSelectElement).value==='custom';$('#custom-command').classList.toggle('hidden',!custom);$('#custom-args').classList.toggle('hidden',!custom);};
